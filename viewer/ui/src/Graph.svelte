@@ -2,7 +2,7 @@
   // The network drawn as a graph: nodes on a circle, links between them.
   // Tree links (a node and its parent) are solid, every other link is dashed,
   // and each carries the cost of crossing it.
-  let { nodes, links, selected, flight, onpick } = $props();
+  let { nodes, links, selected, flight, search, onpick } = $props();
 
   const WIDTH = 760;
   const HEIGHT = 520;
@@ -35,6 +35,10 @@
     }
     return edges;
   });
+
+  // The nodes the last search passed through, ringed until something else
+  // happens. What matters is as much which ones are missing as which are not.
+  const searched = $derived(new Set(search?.visited ?? []));
 
   let dot = $state(null);
 
@@ -84,7 +88,11 @@
         x1={from.x} y1={from.y} x2={to.x} y2={to.y}
         class:tree={link.tree}
         class:lit={lit.has(`${link.a}-${link.b}`)}
-      />
+      >
+        <title>{link.tree
+          ? `${link.a}\u2192${link.b} summary ${link.summary[0]}/256 bits, ${link.b}\u2192${link.a} ${link.summary[1]}/256`
+          : 'not a tree link, so no summary crosses it'}</title>
+      </line>
     {/if}
   {/each}
 
@@ -109,6 +117,7 @@
       <g
         class="node"
         class:selected={selected.includes(node.id)}
+        class:searched={searched.has(node.id)}
         class:root={node.parent === null}
         transform="translate({at.x} {at.y})"
         onclick={() => onpick(node.id)}
@@ -116,7 +125,8 @@
         role="button"
         tabindex="0"
       >
-        <title>path {node.path.join(' → ')}</title>
+        <title>path {node.path.join(' → ')}, holds {node.knows} positions</title>
+        {#if searched.has(node.id)}<circle class="ring" r="31" />{/if}
         <circle r="25" />
         <text dy="0.35em">{node.id}</text>
         {#if selected[0] === node.id}<text class="tag" dy="-2.4em">from</text>{/if}
@@ -171,6 +181,13 @@
     fill: #262b34;
     stroke: #3a414e;
     stroke-width: 2;
+  }
+
+  .node circle.ring {
+    fill: none;
+    stroke: var(--good);
+    stroke-width: 2;
+    stroke-dasharray: 4 4;
   }
 
   .node { cursor: pointer; }

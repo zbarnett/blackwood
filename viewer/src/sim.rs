@@ -37,16 +37,39 @@ pub struct Delivery {
     pub delivered: bool,
     /// What the links it crossed cost, added up.
     pub cost: u64,
+    /// The nodes a search passed through first, if the sender had to ask where
+    /// the destination was. Empty when it already knew.
+    pub searched: Vec<Id>,
 }
 
 impl Delivery {
     /// The JSON fields a caller adds to its response, without the braces.
     pub fn json_fields(&self) -> String {
         format!(
-            r#""route":{},"delivered":{},"cost":{}"#,
+            r#""route":{},"delivered":{},"cost":{},"searched":{}"#,
             json_ids(self.route.iter().copied()),
             self.delivered,
-            self.cost
+            self.cost,
+            json_ids(self.searched.iter().copied()),
+        )
+    }
+}
+
+/// The outcome of one search.
+pub struct Search {
+    /// The nodes it passed through, in the order they saw it.
+    pub visited: Vec<Id>,
+    /// Whether the asker came away holding the target's position.
+    pub found: bool,
+}
+
+impl Search {
+    /// The JSON fields a caller adds to its response, without the braces.
+    pub fn json_fields(&self) -> String {
+        format!(
+            r#""searched":{},"found":{}"#,
+            json_ids(self.visited.iter().copied()),
+            self.found
         )
     }
 }
@@ -67,6 +90,9 @@ pub struct Sim {
     /// the moment somebody presses the button.
     next_id: Id,
     log: Vec<String>,
+    /// The nodes the search now running has passed through. Only [`Sim::run`]
+    /// appends to it, and only [`Sim::look_up`] reads it back.
+    searched: Vec<Id>,
     /// Bumped on every change, so the UI can tell whether it needs to redraw.
     version: u64,
 }
@@ -78,8 +104,9 @@ impl Default for Sim {
 }
 
 impl Sim {
-    /// Builds the network the core's integration test uses, so the viewer opens
-    /// on something worth looking at.
+    /// Builds a network worth opening on: a cycle, one link priced so that the
+    /// cheapest tree is not the shallowest, and a branch for a search to
+    /// decline to go down.
     pub fn new() -> Self {
         let mut sim = Self {
             nodes: BTreeMap::new(),
@@ -88,16 +115,26 @@ impl Sim {
             now: 0,
             next_id: 1,
             log: Vec::new(),
+            searched: Vec::new(),
             version: 0,
         };
         // These cannot fail: the labels are fresh, the links are between
         // distinct nodes that were just created, and no cost is zero.
-        for _ in 0..5 {
+        for _ in 0..6 {
             let _ = sim.add_node();
         }
         // The 2-4 link is the short way round and the dear one, so the tree
-        // that forms is the cheapest one rather than the shallowest.
-        for (a, b, cost) in [(1, 2, 1), (2, 3, 1), (3, 4, 1), (2, 4, 5), (4, 5, 1)] {
+        // that forms is the cheapest one rather than the shallowest. 6 hangs
+        // off 2 on a branch of its own, which is what gives a search somewhere
+        // it can decline to go.
+        for (a, b, cost) in [
+            (1, 2, 1),
+            (2, 3, 1),
+            (3, 4, 1),
+            (2, 4, 5),
+            (4, 5, 1),
+            (2, 6, 1),
+        ] {
             let _ = sim.add_link(a, b, cost);
         }
         sim.log.clear();
@@ -207,10 +244,48 @@ impl Sim {
         }
     }
 
-    /// Sends one packet and traces the path it took.
+    /// Asks the network where a node sits, and traces where the search went.
+    ///
+    /// It is handed on only to the tree neighbours whose summary admits the
+    /// target might lie beyond them, so the nodes it visits are the branches
+    /// that could have held it — and never the whole network, unless every
+    /// summary has filled up enough to stop ruling anything out.
+    pub fn look_up(&mut self, from: Id, to: Id) -> Result<Search, String> {
+        self.require(from)?;
+        self.require(to)?;
+
+        let outbound = self.node(from)?.lookup(key_of(to));
+        self.searched.clear();
+        self.enqueue(from, outbound);
+        self.run();
+
+        let visited = std::mem::take(&mut self.searched);
+        let found = self.knows(from, to);
+        self.note(&format!(
+            "lookup {from} for {to}: {} ({})",
+            if visited.is_empty() {
+                "nobody could hold it".to_string()
+            } else {
+                format!("reached {}", join_ids(&visited))
+            },
+            if found { "found" } else { "no answer" }
+        ));
+        Ok(Search { visited, found })
+    }
+
+    /// Sends one packet and traces the path it took, looking the destination
+    /// up first if this node does not already hold its position.
     pub fn send(&mut self, from: Id, to: Id) -> Result<Delivery, String> {
         self.require(from)?;
         self.require(to)?;
+
+        // A node holds the position of its peers and of whoever it has looked
+        // up lately. Anything else has to be found before it can be addressed.
+        let searched = if self.knows(from, to) {
+            Vec::new()
+        } else {
+            self.look_up(from, to)?.visited
+        };
 
         let outbound = self
             .node_mut(from)?
@@ -225,7 +300,7 @@ impl Sim {
         let mut carrier = from;
         let mut hop = outbound.into_iter().next();
         while let Some(envelope) = hop {
-            let Message::Packet(_) = envelope.message else {
+            let Message::Traffic(_) = envelope.message else {
                 break;
             };
             let next = id_of(envelope.to);
@@ -242,17 +317,14 @@ impl Sim {
         let cost = self.cost_of(&route);
         self.note(&format!(
             "packet {from} to {to}: {} ({delivered_or_not}, cost {cost})",
-            route
-                .iter()
-                .map(Id::to_string)
-                .collect::<Vec<_>>()
-                .join(" \u{2192} "),
+            join_ids(&route),
             delivered_or_not = if delivered { "delivered" } else { "dropped" }
         ));
         Ok(Delivery {
             route,
             delivered,
             cost,
+            searched,
         })
     }
 
@@ -283,7 +355,11 @@ impl Sim {
             .iter()
             .map(|((a, b), cost)| {
                 let tree = self.parent_of(*a) == Some(*b) || self.parent_of(*b) == Some(*a);
-                format!(r#"{{"a":{a},"b":{b},"cost":{cost},"tree":{tree}}}"#)
+                format!(
+                    r#"{{"a":{a},"b":{b},"cost":{cost},"tree":{tree},"summary":[{},{}]}}"#,
+                    self.summary_across(*a, *b),
+                    self.summary_across(*b, *a)
+                )
             })
             .collect::<Vec<_>>()
             .join(",");
@@ -309,12 +385,36 @@ impl Sim {
         self.nodes.values().map(|node| node.known().count()).sum()
     }
 
+    /// How full the summary `from` sends `to` is, or `null` where the link is
+    /// not part of the tree and so carries no summary at all.
+    fn summary_across(&self, from: Id, to: Id) -> String {
+        match self
+            .nodes
+            .get(&from)
+            .and_then(|node| node.summary_for(key_of(to)))
+        {
+            Some(summary) => summary.filled().to_string(),
+            None => "null".into(),
+        }
+    }
+
+    /// Whether `from` holds a position for `to` and could address it now.
+    fn knows(&self, from: Id, to: Id) -> bool {
+        self.nodes
+            .get(&from)
+            .is_some_and(|node| node.known().any(|known| known == key_of(to)))
+    }
+
     fn require(&self, id: Id) -> Result<(), String> {
         if self.nodes.contains_key(&id) {
             Ok(())
         } else {
             Err(format!("no node {id}"))
         }
+    }
+
+    fn node(&self, id: Id) -> Result<&Node, String> {
+        self.nodes.get(&id).ok_or(format!("no node {id}"))
     }
 
     fn node_mut(&mut self, id: Id) -> Result<&mut Node, String> {
@@ -391,6 +491,9 @@ impl Sim {
             let Some(in_flight) = self.queue.pop_front() else {
                 return;
             };
+            if matches!(in_flight.message, Message::Lookup(_)) {
+                self.searched.push(id_of(in_flight.to));
+            }
             let now = self.now;
             let Ok(node) = self.node_mut(id_of(in_flight.to)) else {
                 continue;
@@ -413,6 +516,14 @@ fn price(cost: u64) -> Result<Cost, String> {
 
 fn ordered(a: Id, b: Id) -> (Id, Id) {
     if a <= b { (a, b) } else { (b, a) }
+}
+
+/// Node labels as an arrow-separated trail, for the log.
+fn join_ids(ids: &[Id]) -> String {
+    ids.iter()
+        .map(Id::to_string)
+        .collect::<Vec<_>>()
+        .join(" \u{2192} ")
 }
 
 fn json_ids(ids: impl Iterator<Item = Id>) -> String {

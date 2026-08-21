@@ -11,12 +11,13 @@
 //! # How it works
 //!
 //! The node with the smallest key in a connected component becomes the root.
-//! Every node announces the path of keys running from that root down to itself,
-//! and gossips the announcements it hears onward to its peers. Announcements
-//! are only ever authored by the node they describe, so the set of them is a
-//! conflict-free replicated map of key to announcement whose join per author is
-//! simply the greater of the two: no coordination, no ordering requirements on
-//! the network, and no divergence between nodes.
+//! Every node announces the path of keys running from that root down to itself.
+//! An announcement crosses one link and stops: a node needs to know where its
+//! own peers sit and nothing else, so nothing is ever relayed and nothing
+//! accumulates. Announcements are only ever authored by the node they describe,
+//! so what a node holds about each of its peers is a max register, its join
+//! simply the greater of the two — a repeat, or one that arrives out of order,
+//! can be dropped on sight rather than reasoned about.
 //!
 //! Given two announcements, the distance between their authors is the walk up
 //! to their lowest common ancestor and back down. A node forwards a packet to
@@ -36,6 +37,30 @@
 //! packet to whichever leaves the least left to pay. A [`Cost`] is never zero,
 //! which is what keeps both of the properties above standing; a network whose
 //! links all cost [`Cost::UNIT`] measures distance in hops.
+//!
+//! The destination's path travels in the packet, since no node along the way
+//! holds it. That is also what makes the first property exact rather than
+//! nearly so: every node on the route measures its progress against the same
+//! target, instead of against its own copy of one.
+//!
+//! # Finding a node
+//!
+//! Addressing a node that is not a peer means finding out where it sits first.
+//! Each node keeps, for each of its tree links, a [`Summary`] of the keys
+//! reachable through it — a Bloom filter, a fixed few bytes however much lies
+//! beyond — got by folding together what its *other* tree links told it.
+//! Leaving out the link the summary is bound for is the whole trick: it makes
+//! each one mean "what is on my side of this", and it is why summaries cross
+//! tree links only. Folded around a cycle they would carry every key back to
+//! where it came from until each one claimed the entire network.
+//!
+//! A search then walks the tree, handed on at each step only to the neighbours
+//! whose summary admits the target might lie beyond them, and the node being
+//! looked for answers by retracing the search's own trail. A summary never
+//! misses a key it holds, so a search cannot overlook the branch its target is
+//! really on; one that claims a key it does not hold costs a detour and nothing
+//! more. As a summary fills, it prunes less, and in the limit a search is a
+//! flood — which is what this would be without any of it.
 //!
 //! The tree itself is loop-free for a separate reason: an announcement carries
 //! its whole path, and a node refuses to sit below any path that already runs
@@ -60,15 +85,18 @@
 //! That is what makes a network of them deterministically simulatable and what
 //! should make the argument above tractable to check in a proof assistant.
 //!
-//! Two things ironwood does are deliberately left out, each of them a
-//! hardening or an optimisation of the model above rather than part of it:
+//! What a node holds is a fixed amount per link, its own position, and the
+//! positions of the nodes it is currently talking to — the last of these being
+//! the only part that grows with use, and expiry is what bounds it. Nothing
+//! here scales with the size of the network.
+//!
+//! One thing ironwood does is deliberately left out, a hardening of the model
+//! above rather than part of it:
 //!
 //! - **Cryptography.** Ironwood signs announcements so a node cannot lie about
-//!   its parent. Here a key is an opaque identifier and announcements are
-//!   trusted, so this core is correct only among honest participants.
-//! - **Bloom filters.** Ironwood keeps constant state per peer and finds
-//!   unknown destinations by lookup. Here every node learns every announcement,
-//!   which is linear in the size of the network but needs no lookup protocol.
+//!   its parent, or about where some other node sits when it answers a search.
+//!   Here a key is an opaque identifier and both are trusted, so this core is
+//!   correct only among honest participants.
 //!
 //! # Example
 //!
@@ -97,7 +125,8 @@
 //! assert_eq!(b_node.parent(), Some(a));
 //! assert_eq!(b_node.cost_to_root(), 1);
 //!
-//! // A packet crosses the single hop.
+//! // A packet crosses the single hop. b is a's peer, so a already holds its
+//! // position; anywhere further would have to be found with `lookup` first.
 //! for envelope in a_node.send(b, b"hello".to_vec()).expect("route is known") {
 //!     b_node.handle(0, a, envelope.message);
 //! }
@@ -114,9 +143,11 @@
 pub mod key;
 pub mod message;
 pub mod node;
+pub mod summary;
 pub mod tree;
 
 pub use key::{KEY_LEN, PublicKey};
-pub use message::{Envelope, Message, Packet};
+pub use message::{Envelope, Found, Lookup, Message, Packet, Traffic};
 pub use node::{Node, SendError, Timing};
+pub use summary::Summary;
 pub use tree::{Announcement, Cost, Hop, MalformedAnnouncement, distance};

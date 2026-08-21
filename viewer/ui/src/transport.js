@@ -47,6 +47,7 @@ async function overWasm() {
     'link/cost': (p) => exports.link_cost(Number(p.a), Number(p.b), Number(p.cost)),
     'link/remove': (p) => exports.link_remove(Number(p.a), Number(p.b)),
     advance: (p) => exports.advance(Number(p.by)),
+    lookup: (p) => exports.lookup(Number(p.from), Number(p.to)),
     send: (p) => exports.send(Number(p.from), Number(p.to)),
     reset: () => exports.reset(),
   };

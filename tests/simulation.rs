@@ -29,6 +29,8 @@ struct Network {
     queue: VecDeque<InFlight>,
     /// How many times a packet has been handed to a node, i.e. hops taken.
     hops: usize,
+    /// The nodes the last search passed through, in the order they saw it.
+    searched: Vec<PublicKey>,
     /// The clock every node shares. Only [`Network::advance`] moves it.
     now: u64,
 }
@@ -39,6 +41,7 @@ impl Network {
             nodes: keys.into_iter().map(|k| (k, Node::new(0, k))).collect(),
             queue: VecDeque::new(),
             hops: 0,
+            searched: Vec::new(),
             now: 0,
         }
     }
@@ -114,8 +117,10 @@ impl Network {
             let Some(in_flight) = self.queue.pop_front() else {
                 return;
             };
-            if matches!(in_flight.message, Message::Packet(_)) {
-                self.hops += 1;
+            match in_flight.message {
+                Message::Traffic(_) => self.hops += 1,
+                Message::Lookup(_) => self.searched.push(in_flight.to),
+                _ => {}
             }
             let now = self.now;
             let outbound =
@@ -123,6 +128,28 @@ impl Network {
                     .handle(now, in_flight.from, in_flight.message);
             self.enqueue(in_flight.to, outbound);
         }
+    }
+
+    /// Asks the network where `dst` sits on `src`'s behalf, and reports which
+    /// nodes the search passed through.
+    fn find(&mut self, src: PublicKey, dst: PublicKey) -> Vec<PublicKey> {
+        let outbound = self.node(src).lookup(dst);
+        self.searched.clear();
+        self.enqueue(src, outbound);
+        self.run();
+        std::mem::take(&mut self.searched)
+    }
+
+    /// Looks up where `dst` sits and then sends one packet to it, which is the
+    /// two steps every conversation between strangers begins with.
+    fn send(&mut self, src: PublicKey, dst: PublicKey, payload: &[u8]) {
+        self.find(src, dst);
+        let outbound = self
+            .node_mut(src)
+            .send(dst, payload.to_vec())
+            .unwrap_or_else(|error| panic!("{src:?} cannot reach {dst:?}: {error}"));
+        self.enqueue(src, outbound);
+        self.run();
     }
 
     /// Where every node believes it sits, for comparing one moment to another.
@@ -164,13 +191,7 @@ impl Network {
                     continue;
                 }
                 let payload = vec![src.as_bytes()[0], dst.as_bytes()[0]];
-                let outbound = self
-                    .node_mut(src)
-                    .send(dst, payload.clone())
-                    .unwrap_or_else(|error| panic!("{src:?} has no route to {dst:?}: {error}"));
-                self.enqueue(src, outbound);
-                self.run();
-
+                self.send(src, dst, &payload);
                 assert_eq!(
                     self.node_mut(dst).take_delivered(),
                     vec![Packet { src, dst, payload }]
@@ -256,12 +277,7 @@ fn brings_up_a_network_and_carries_a_packet_across_it() {
     net.paths_agree_with_parents(&[a, b, c, d, e]);
 
     // One packet, from the root down to the far end of the tail.
-    let outbound = net
-        .node_mut(a)
-        .send(e, b"hello ironwood".to_vec())
-        .expect("the route is known once the tree has settled");
-    net.enqueue(a, outbound);
-    net.run();
+    net.send(a, e, b"hello ironwood");
 
     assert_eq!(
         net.node_mut(e).take_delivered(),
@@ -278,6 +294,93 @@ fn brings_up_a_network_and_carries_a_packet_across_it() {
         );
     }
     assert_eq!(net.hops, 3, "expected a -> b -> d -> e");
+}
+
+#[test]
+fn a_node_holds_a_position_for_its_peers_and_nobody_else() {
+    let (mut net, keys) = ring_with_a_tail();
+    net.run();
+
+    for node in keys {
+        let peers: Vec<_> = net.node(node).peers().map(|(peer, _)| peer).collect();
+        let known: Vec<_> = net.node(node).known().collect();
+        assert_eq!(known, peers, "{node:?} holds a position it never asked for");
+    }
+
+    // Ten positions held across the network, two per link, rather than the
+    // twenty a flood would leave — and the gap widens with every node added.
+    let held: usize = keys.iter().map(|&k| net.node(k).known().count()).sum();
+    assert_eq!(held, 10);
+}
+
+#[test]
+fn a_search_reaches_only_the_branches_that_might_hold_its_target() {
+    let (mut net, [a, b, _c, d, e]) = ring_with_a_tail();
+    net.run();
+
+    // The tree runs a - b, b - c, b - d, d - e, so e lies beyond d and nowhere
+    // near c. b passes the search to d alone: what c told it about its own side
+    // of their link says e is not down there, and that is the whole point of a
+    // summary.
+    assert_eq!(net.find(a, e), vec![b, d, e]);
+    assert!(
+        net.node(a).known().any(|known| known == e),
+        "the answer came back and a can now address e"
+    );
+
+    // Nothing anywhere claims a key that was never in the network, so a search
+    // for one leaves the asker's own doorstep and stops.
+    assert!(net.find(a, key(9)).is_empty());
+    assert!(!net.node(a).known().any(|known| known == key(9)));
+}
+
+#[test]
+fn a_search_finds_every_node_from_every_node() {
+    let (mut net, keys) = ring_with_a_tail();
+    net.run();
+
+    for src in keys {
+        for dst in keys {
+            if src == dst {
+                continue;
+            }
+            let searched = net.find(src, dst);
+            assert!(
+                searched.contains(&dst),
+                "a search from {src:?} never reached {dst:?}, visiting {searched:?}"
+            );
+            assert!(
+                net.node(src).known().any(|known| known == dst),
+                "{src:?} asked where {dst:?} was and got no answer"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_summary_names_everything_on_its_own_side_of_a_link_and_nothing_else() {
+    let (mut net, [a, b, c, d, e]) = ring_with_a_tail();
+    net.run();
+
+    // Taking the tree link b - d out leaves a, b, c on one side and d, e on
+    // the other, and each end's summary describes exactly its own side.
+    let above = net.node(b).summary_for(d).expect("b - d is a tree link");
+    let below = net.node(d).summary_for(b).expect("b - d is a tree link");
+
+    for near in [a, b, c] {
+        assert!(above.contains(near), "b's side is missing {near:?}");
+        assert!(!below.contains(near), "d's side wrongly claims {near:?}");
+    }
+    for far in [d, e] {
+        assert!(below.contains(far), "d's side is missing {far:?}");
+        assert!(!above.contains(far), "b's side wrongly claims {far:?}");
+    }
+
+    // The c - d link closes the cycle and is not part of the tree, so no
+    // summary crosses it. Folding them around a cycle would carry every key
+    // back to where it came from until both ends claimed everything.
+    assert_eq!(net.node(c).summary_for(d), None);
+    assert_eq!(net.node(d).summary_for(c), None);
 }
 
 #[test]
@@ -315,12 +418,7 @@ fn the_cheapest_walk_wins_over_the_shortest_one() {
 
     // The same packet the unit-cost network carries in three hops. Here it
     // takes four, and pays 4 rather than the 7 the short way would have cost.
-    let outbound = net
-        .node_mut(a)
-        .send(e, b"the long way round".to_vec())
-        .expect("the route is known once the tree has settled");
-    net.enqueue(a, outbound);
-    net.run();
+    net.send(a, e, b"the long way round");
 
     assert_eq!(
         net.node_mut(e).take_delivered(),
@@ -342,12 +440,7 @@ fn a_packet_refuses_an_expensive_shortcut() {
     // Crossing it costs 5, where walking the tree by way of c costs 3.
     assert!(net.node(b).peers().any(|(peer, _)| peer == d));
 
-    let outbound = net
-        .node_mut(b)
-        .send(e, b"not that way".to_vec())
-        .expect("the route is known");
-    net.enqueue(b, outbound);
-    net.run();
+    net.send(b, e, b"not that way");
 
     assert!(!net.node_mut(e).take_delivered().is_empty());
     assert_eq!(net.hops, 3, "expected b -> c -> d -> e, not b -> d -> e");
@@ -377,15 +470,13 @@ fn re_pricing_a_link_reshapes_the_tree() {
     assert_eq!(net.node(e).cost_to_root(), 3);
     net.paths_agree_with_parents(&[a, b, c, d, e]);
 
-    // c re-parents nowhere — it was already below b — but the route to e
-    // through the network has moved onto the link that just got cheaper.
+    // The tree moved, so the summaries moved with it: c - d has stopped being
+    // a tree link and b - d has become one.
     assert_eq!(net.node(c).parent(), Some(b));
-    let outbound = net
-        .node_mut(a)
-        .send(e, b"straight through".to_vec())
-        .expect("route");
-    net.enqueue(a, outbound);
-    net.run();
+    assert_eq!(net.node(d).summary_for(c), None);
+    assert!(net.node(d).summary_for(b).is_some());
+
+    net.send(a, e, b"straight through");
     assert!(!net.node_mut(e).take_delivered().is_empty());
     assert_eq!(net.hops, 3, "expected a -> b -> d -> e");
 }
@@ -412,6 +503,12 @@ fn a_link_coming_up_late_is_absorbed() {
     }
     assert_eq!(net.node(b).parent(), Some(a));
     assert_eq!(net.node(c).parent(), Some(b));
+
+    // c can be found from a even though nothing between them ever held its
+    // position: the search walks down the summaries and the answer walks back.
+    assert_eq!(net.find(a, c), vec![b, c]);
+    net.send(a, c, b"welcome");
+    assert!(!net.node_mut(c).take_delivered().is_empty());
 }
 
 #[test]
@@ -432,8 +529,8 @@ fn a_settled_network_is_undisturbed_by_the_passage_of_time() {
     for node in keys {
         assert_eq!(
             net.node(node).known().count(),
-            keys.len() - 1,
-            "everyone still knows where everyone else is"
+            net.node(node).peers().count(),
+            "everyone still knows where its own peers are"
         );
     }
 }
@@ -443,17 +540,20 @@ fn a_stranded_node_is_eventually_forgotten() {
     let (mut net, [a, b, c, d, e]) = ring_with_a_tail();
     net.run();
 
+    // a asks where e is and is told, which is the only reason it holds a
+    // position for a node three hops away.
+    net.find(a, e);
+    assert!(net.node(a).known().any(|known| known == e));
+
     // e hangs off d alone, so taking that link down strands it.
     net.unlink(d, e);
     net.run();
 
-    // Its neighbours reparent at once, but nothing has yet told them e is gone,
-    // so they still believe they hold a route to it.
-    assert!(net.node(d).known().any(|known| known == e));
-    assert!(
-        net.node_mut(a).send(e, b"still there?".to_vec()).is_ok(),
-        "a would send a packet into the dead end"
-    );
+    // Nothing has told a that e is gone, so it would still send a packet into
+    // what is now a dead end. The summaries, though, moved at once: d stopped
+    // claiming e the moment the link went.
+    assert!(net.node_mut(a).send(e, b"still there?".to_vec()).is_ok());
+    assert!(net.find(a, e).is_empty(), "no branch admits e any more");
 
     net.advance(Timing::DEFAULT.expiry);
 
@@ -465,7 +565,7 @@ fn a_stranded_node_is_eventually_forgotten() {
     }
     assert_eq!(
         net.node_mut(a).send(e, b"gone".to_vec()),
-        Err(SendError::NoRoute),
+        Err(SendError::Unknown),
         "the route to nowhere is gone rather than silently dropping packets"
     );
     assert_eq!(net.node(e).root(), e, "and e is now a network of one");
@@ -496,12 +596,7 @@ fn a_node_that_starts_over_rejoins_the_tree() {
     );
     assert_eq!(net.node(e).parent(), Some(d));
 
-    let outbound = net
-        .node_mut(a)
-        .send(e, b"welcome back".to_vec())
-        .expect("the route is known again");
-    net.enqueue(a, outbound);
-    net.run();
+    net.send(a, e, b"welcome back");
     assert_eq!(
         net.node_mut(e).take_delivered(),
         vec![Packet {

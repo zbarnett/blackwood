@@ -5,20 +5,28 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::key::PublicKey;
-use crate::message::{Envelope, Message, Packet};
+use crate::message::{Envelope, Found, Lookup, Message, Packet, Traffic};
+use crate::summary::Summary;
 use crate::tree::{Announcement, Cost, Hop, distance};
 
 /// Why a packet could not be handed to the network.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SendError {
-    /// Either the destination's position in the tree is unknown, or no linked
-    /// peer stands closer to it than this node does.
+    /// Nothing here knows where the destination sits.
+    ///
+    /// A node holds the coordinates of its peers and of whoever it has already
+    /// looked up; for anything else, ask the network with [`Node::lookup`] and
+    /// try again once the answer has arrived.
+    Unknown,
+    /// The destination's position is known, but no linked peer stands closer to
+    /// it than this node does, so the packet has nowhere to go but backwards.
     NoRoute,
 }
 
 impl fmt::Display for SendError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Unknown => f.write_str("destination has not been looked up"),
             Self::NoRoute => f.write_str("no route to destination"),
         }
     }
@@ -33,9 +41,13 @@ impl std::error::Error for SendError {}
 /// one instant it was handed from another.
 ///
 /// `refresh` must be comfortably smaller than `expiry`. A node's announcement
-/// has to be reissued, and the reissue flooded, several times over before its
-/// peers would otherwise give up on it. Set them too close together and a
-/// perfectly healthy network forgets nodes it is about to hear from again.
+/// has to be reissued several times over before its peers would otherwise give
+/// up on it. Set them too close together and a perfectly healthy network
+/// forgets nodes it is about to hear from again.
+///
+/// `expiry` also bounds how long a looked-up position is kept. A conversation
+/// that outlives it costs another lookup, which is the price of not keeping
+/// what nobody is using.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Timing {
     /// How long a node leaves its own announcement alone before reissuing it.
@@ -70,6 +82,23 @@ struct Info {
     heard_at: u64,
 }
 
+/// What a node keeps about one link.
+///
+/// A fixed amount, whatever the network beyond it looks like. The peer's own
+/// position is not here but among the announcements the node holds, since that
+/// is where routing reads it from.
+#[derive(Clone, Debug)]
+struct Peer {
+    /// What crossing the link costs.
+    cost: Cost,
+    /// What the peer says lies on its side of it.
+    beyond: Summary,
+    /// What this node last said lies on its own side, or `None` if it has said
+    /// nothing because the link is not part of the tree. Keeping it is what
+    /// lets a node speak only when something has changed, and so fall quiet.
+    told: Option<Summary>,
+}
+
 /// One node's complete routing state.
 ///
 /// A node is a pure state machine: every method takes an event and returns the
@@ -78,6 +107,10 @@ struct Info {
 /// caller passes in — an opaque count in the caller's own unit, which is only
 /// ever subtracted from a later `now`, so its origin is arbitrary but it must
 /// not go backwards.
+///
+/// What it holds is a fixed amount per link, its own position, and the
+/// positions of the nodes it is currently talking to. Nothing here grows with
+/// the size of the network.
 #[derive(Clone, Debug)]
 pub struct Node {
     key: PublicKey,
@@ -86,9 +119,10 @@ pub struct Node {
     announcement: Announcement,
     /// When this node last issued the announcement above.
     announced_at: u64,
-    /// Peers reachable over a direct link, and what each link costs.
-    peers: BTreeMap<PublicKey, Cost>,
-    /// What this node has heard about every *other* node, and when.
+    /// The links this node holds.
+    peers: BTreeMap<PublicKey, Peer>,
+    /// Where other nodes sit: every peer, since a peer announces itself across
+    /// the link, and whoever else has been looked up and not yet forgotten.
     infos: BTreeMap<PublicKey, Info>,
     delivered: Vec<Packet>,
 }
@@ -145,25 +179,35 @@ impl Node {
 
     /// The peers this node holds a link to, and what each link costs.
     pub fn peers(&self) -> impl Iterator<Item = (PublicKey, Cost)> + '_ {
-        self.peers.iter().map(|(&peer, &cost)| (peer, cost))
+        self.peers.iter().map(|(&peer, state)| (peer, state.cost))
     }
 
-    /// The other nodes this one currently holds an announcement for.
+    /// What this node last told `peer` lies on its own side of their link.
     ///
-    /// This is what expiry shrinks and gossip grows, and it is exactly the set
-    /// of destinations [`send`](Self::send) can name.
+    /// `None` when the link is not part of the spanning tree, since that is the
+    /// only sort a summary crosses.
+    pub fn summary_for(&self, peer: PublicKey) -> Option<Summary> {
+        self.peers.get(&peer).and_then(|state| state.told)
+    }
+
+    /// The other nodes this one currently holds a position for.
+    ///
+    /// Its peers, and whoever it has looked up and not yet forgotten. It is
+    /// exactly the set of destinations [`send`](Self::send) can name without
+    /// asking the network first, and expiry is what keeps it from growing.
     pub fn known(&self) -> impl Iterator<Item = PublicKey> + '_ {
         self.infos.keys().copied()
     }
 
     /// Moves this node's clock to `now`, expiring and reissuing state.
     ///
-    /// Three things happen, in that order. Announcements not heard again within
+    /// Three things happen, in that order. Positions not heard again within
     /// [`Timing::expiry`] are forgotten, which is how a node that vanished
     /// stops being remembered as a route to nowhere. Losing them may have cost
-    /// this node its parent, so it reconsiders where it sits. Finally, if its
-    /// own announcement has stood for [`Timing::refresh`] without being
-    /// reissued, it reissues it, which is what stops peers forgetting *it*.
+    /// this node its parent or changed what it can reach, so it reconsiders
+    /// both. Finally, if its own announcement has stood for [`Timing::refresh`]
+    /// without being reissued, it reissues it, which is what stops its peers
+    /// forgetting *it*.
     ///
     /// This is the only method that involves the passage of time, and a node
     /// that is never ticked behaves exactly as though it did not exist: state
@@ -173,7 +217,7 @@ impl Node {
         let expiry = self.timing.expiry;
         self.infos
             .retain(|_, info| now.saturating_sub(info.heard_at) < expiry);
-        self.reparent(now, &mut out);
+        self.settle(now, &mut out);
         if now.saturating_sub(self.announced_at) >= self.timing.refresh {
             let unchanged = self.announcement.clone();
             self.announce(now, unchanged, &mut out);
@@ -183,48 +227,54 @@ impl Node {
 
     /// Brings up a link to `peer`, costing `cost` to cross.
     ///
-    /// The new peer is sent everything this node knows, which is what makes a
-    /// fresh link converge without any separate handshake.
+    /// The peer is told where this node sits, and nothing else: that is all it
+    /// needs in order to decide whether to sit below this one, and it learns
+    /// the rest of the network the way anybody does, by asking.
     ///
     /// Calling this for a link that is already up re-prices it instead, which
     /// is how a caller that keeps measuring its links reports what it found.
-    /// Nothing is resent: the peer already has everything, and what changed is
-    /// only this node's own view of what reaching it costs.
     pub fn add_peer(&mut self, now: u64, peer: PublicKey, cost: Cost) -> Vec<Envelope> {
         let mut out = Vec::new();
         if peer == self.key {
             return out;
         }
-        match self.peers.insert(peer, cost) {
-            Some(previous) => {
-                if previous != cost {
-                    self.reparent(now, &mut out);
+        match self.peers.get_mut(&peer) {
+            Some(state) => {
+                if state.cost == cost {
+                    return out;
                 }
+                state.cost = cost;
             }
             None => {
-                for info in self.announcements() {
-                    out.push(Envelope {
-                        to: peer,
-                        message: Message::Announce(info.clone()),
-                    });
-                }
-                self.reparent(now, &mut out);
+                self.peers.insert(
+                    peer,
+                    Peer {
+                        cost,
+                        beyond: Summary::new(),
+                        told: None,
+                    },
+                );
+                out.push(Envelope {
+                    to: peer,
+                    message: Message::Announce(self.announcement.clone()),
+                });
             }
         }
+        self.settle(now, &mut out);
         out
     }
 
     /// Tears down the link to `peer`.
     ///
     /// What this node learned *through* `peer` is not withdrawn here, because
-    /// it cannot tell which of those routes were only reachable that way. Those
-    /// announcements are left to expire on their own, which is what
-    /// [`tick`](Self::tick) is for. Until they do, routing towards a departed
-    /// node fails by dropping the packet at the dead end.
+    /// it cannot tell which of those positions were only reachable that way.
+    /// They are left to expire on their own, which is what [`tick`](Self::tick)
+    /// is for. Until they do, routing towards a departed node fails by dropping
+    /// the packet at the dead end.
     pub fn remove_peer(&mut self, now: u64, peer: PublicKey) -> Vec<Envelope> {
         let mut out = Vec::new();
         if self.peers.remove(&peer).is_some() {
-            self.reparent(now, &mut out);
+            self.settle(now, &mut out);
         }
         out
     }
@@ -241,12 +291,20 @@ impl Node {
             Message::Announce(announcement) => {
                 self.receive_announce(now, from, announcement, &mut out)
             }
-            Message::Packet(packet) => self.forward(packet, &mut out),
+            Message::Summary(summary) => self.receive_summary(now, from, summary, &mut out),
+            Message::Lookup(lookup) => self.receive_lookup(from, lookup, &mut out),
+            Message::Found(found) => self.receive_found(now, found, &mut out),
+            Message::Traffic(traffic) => self.forward(traffic, &mut out),
         }
         out
     }
 
     /// Originates a packet addressed to `dst`.
+    ///
+    /// Fails with [`SendError::Unknown`] unless this node holds `dst`'s
+    /// position, which it does for a peer and for anything it has looked up
+    /// recently. That position travels with the packet, since no node further
+    /// along the way holds it either.
     pub fn send(&mut self, dst: PublicKey, payload: Vec<u8>) -> Result<Vec<Envelope>, SendError> {
         let packet = Packet {
             src: self.key,
@@ -257,11 +315,39 @@ impl Node {
             self.delivered.push(packet);
             return Ok(Vec::new());
         }
-        let peer = self.next_hop(&dst).ok_or(SendError::NoRoute)?;
+        let dst_path = self.info(&dst).ok_or(SendError::Unknown)?.path().to_vec();
+        let peer = self.next_hop(&dst_path).ok_or(SendError::NoRoute)?;
         Ok(vec![Envelope {
             to: peer,
-            message: Message::Packet(packet),
+            message: Message::Traffic(Traffic { dst_path, packet }),
         }])
+    }
+
+    /// Asks the network where `target` sits.
+    ///
+    /// The search goes to every tree neighbour whose summary admits the target
+    /// might lie beyond it, and each of those does the same, so it fans out
+    /// down the branches that could hold it and no others. A summary never
+    /// misses a key it holds, so on a settled tree a search cannot fail to find
+    /// a node that is there; one that claims a key it does not hold costs the
+    /// search a detour and nothing more.
+    ///
+    /// The answer arrives later, as a message like any other, and is what makes
+    /// a subsequent [`send`](Self::send) to `target` work. Nothing is recorded
+    /// about the asking, so a search that finds nothing simply goes unanswered
+    /// and this node is free to ask again.
+    pub fn lookup(&self, target: PublicKey) -> Vec<Envelope> {
+        let mut out = Vec::new();
+        if target != self.key {
+            self.search(
+                &Lookup {
+                    target,
+                    trail: vec![self.key],
+                },
+                &mut out,
+            );
+        }
+        out
     }
 
     /// Takes the packets addressed to this node that have arrived so far.
@@ -269,15 +355,38 @@ impl Node {
         std::mem::take(&mut self.delivered)
     }
 
-    /// Every announcement this node holds, its own included.
-    fn announcements(&self) -> impl Iterator<Item = &Announcement> {
-        std::iter::once(&self.announcement)
-            .chain(self.infos.values().map(|info| &info.announcement))
-    }
-
     /// What this node last heard about `key`, if it still holds it.
     fn info(&self, key: &PublicKey) -> Option<&Announcement> {
         self.infos.get(key).map(|info| &info.announcement)
+    }
+
+    /// Takes note of where another node says it sits, reporting whether it was
+    /// news.
+    ///
+    /// Only news restarts the expiry clock. A repeat of a position already held
+    /// is not evidence its author is still there, and treating it as such would
+    /// let an echo keep a dead node alive.
+    fn remember(&mut self, now: u64, announcement: Announcement) -> bool {
+        let author = announcement.author();
+        // A node is the only authority on where it sits, so anything arriving
+        // about this one is at best a stale echo of its own.
+        if author == self.key {
+            return false;
+        }
+        if self
+            .info(&author)
+            .is_some_and(|known| !announcement.supersedes(known))
+        {
+            return false;
+        }
+        self.infos.insert(
+            author,
+            Info {
+                announcement,
+                heard_at: now,
+            },
+        );
+        true
     }
 
     fn receive_announce(
@@ -287,32 +396,101 @@ impl Node {
         announcement: Announcement,
         out: &mut Vec<Envelope>,
     ) {
-        let author = announcement.author();
-        // A node is the only authority on where it sits, so an announcement
-        // about ourselves is at best a stale echo of our own.
-        if author == self.key {
+        // An announcement crosses exactly one link and describes whoever sent
+        // it. Nothing relays one, so a node hears about its peers and about
+        // nobody else, which is the whole of what keeps this state constant.
+        if announcement.author() != from {
             return;
         }
-        if self
-            .info(&author)
-            .is_some_and(|known| !announcement.supersedes(known))
-        {
+        if self.remember(now, announcement) {
+            self.settle(now, out);
+        }
+    }
+
+    fn receive_summary(
+        &mut self,
+        now: u64,
+        from: PublicKey,
+        summary: Summary,
+        out: &mut Vec<Envelope>,
+    ) {
+        let Some(state) = self.peers.get_mut(&from) else {
+            return;
+        };
+        // Only a change is worth working through, which is what brings the
+        // exchange to rest: a summary that says nothing new ends here.
+        if state.beyond == summary {
             return;
         }
-        // Only an announcement that was accepted restarts the expiry clock. A
-        // repeat of one already held is not evidence its author is still there,
-        // and treating it as such would let an echo keep a dead node alive.
-        self.infos.insert(
-            author,
-            Info {
-                announcement: announcement.clone(),
-                heard_at: now,
-            },
-        );
-        // Only news travels. Gossip therefore terminates: each hop strictly
-        // advances some author's announcement, and that cannot rise forever.
-        self.gossip(Message::Announce(announcement), Some(from), out);
+        state.beyond = summary;
+        self.settle(now, out);
+    }
+
+    fn receive_lookup(&mut self, from: PublicKey, mut lookup: Lookup, out: &mut Vec<Envelope>) {
+        // A search that has already been here has gone round in a circle, which
+        // a half-settled tree can arrange. Refusing it is the rule that keeps
+        // the tree acyclic, applied to a walk rather than to a path.
+        if lookup.trail.contains(&self.key) {
+            return;
+        }
+        if lookup.target == self.key {
+            out.push(Envelope {
+                to: from,
+                message: Message::Found(Found {
+                    announcement: self.announcement.clone(),
+                    trail: lookup.trail,
+                }),
+            });
+            return;
+        }
+        lookup.trail.push(self.key);
+        self.search(&lookup, out);
+    }
+
+    fn receive_found(&mut self, now: u64, mut found: Found, out: &mut Vec<Envelope>) {
+        // The trail is the way home and this node should be standing on the end
+        // of it. Anything else is the answer to a search that never came
+        // through here, and this node is not on its way anywhere.
+        if found.trail.pop() != Some(self.key) {
+            return;
+        }
+        match found.trail.last() {
+            Some(&back) if self.peers.contains_key(&back) => out.push(Envelope {
+                to: back,
+                message: Message::Found(found),
+            }),
+            // The trail is spent, so this node is the one that asked. An answer
+            // is trusted exactly as an announcement is: with signatures it
+            // could not be forged, and without them it is taken on faith.
+            None => {
+                self.remember(now, found.announcement);
+            }
+            // The link the search came in over has gone down since. Dropping
+            // the answer costs the asker a retry it was free to make anyway.
+            Some(_) => {}
+        }
+    }
+
+    /// Passes a search on to every tree neighbour that might hold its target.
+    fn search(&self, lookup: &Lookup, out: &mut Vec<Envelope>) {
+        for (&peer, state) in &self.peers {
+            if !lookup.trail.contains(&peer)
+                && self.is_tree_neighbour(peer)
+                && state.beyond.contains(lookup.target)
+            {
+                out.push(Envelope {
+                    to: peer,
+                    message: Message::Lookup(lookup.clone()),
+                });
+            }
+        }
+    }
+
+    /// Reconsiders where this node sits and what lies on its side of each tree
+    /// link, saying whatever changed.
+    fn settle(&mut self, now: u64, out: &mut Vec<Envelope>) {
         self.reparent(now, out);
+        self.resummarise(out);
     }
 
     /// Reconsiders which peer to sit below, announcing the move if it changed.
@@ -333,7 +511,13 @@ impl Node {
         let seq = self.announcement.seq().saturating_add(1);
         self.announcement = position.with_seq(seq);
         self.announced_at = now;
-        self.gossip(Message::Announce(self.announcement.clone()), None, out);
+        let message = Message::Announce(self.announcement.clone());
+        for &peer in self.peers.keys() {
+            out.push(Envelope {
+                to: peer,
+                message: message.clone(),
+            });
+        }
     }
 
     /// The most preferred position available: below some peer, or self-rooted.
@@ -342,11 +526,11 @@ impl Node {
         // stamps the winner with the right one.
         let seq = self.announcement.seq();
         let mut best = Announcement::root_of(self.key, seq);
-        for (peer, &cost) in &self.peers {
+        for (peer, state) in &self.peers {
             let Some(info) = self.info(peer) else {
                 continue;
             };
-            let Some(candidate) = info.extend(self.key, cost, seq) else {
+            let Some(candidate) = info.extend(self.key, state.cost, seq) else {
                 continue;
             };
             if candidate.preference_cmp(&best) == Ordering::Less {
@@ -356,50 +540,101 @@ impl Node {
         best
     }
 
-    fn gossip(&self, message: Message, except: Option<PublicKey>, out: &mut Vec<Envelope>) {
-        for &peer in self.peers.keys() {
-            if Some(peer) != except {
+    /// Whether the link to `peer` is part of the spanning tree.
+    ///
+    /// Summaries cross tree links and no others. Folding them together around a
+    /// cycle would carry every key back to where it came from, until every
+    /// summary claimed the whole network and none of them pruned anything. Over
+    /// a tree the fixed point is exactly "what lies on the far side of this
+    /// link", and a walk guided by them cannot come back on itself.
+    fn is_tree_neighbour(&self, peer: PublicKey) -> bool {
+        self.parent() == Some(peer)
+            || self
+                .info(&peer)
+                .is_some_and(|info| info.parent() == Some(self.key))
+    }
+
+    /// What this node would tell `peer` lies on its own side of their link:
+    /// itself, and whatever the other tree links say lies beyond them.
+    ///
+    /// Leaving out what `peer` said is the whole of it. Without that, each of
+    /// the two would hand the other back the other's own subtree, and they
+    /// would end up agreeing that everything was on both sides.
+    fn summary_beyond(&self, peer: PublicKey) -> Summary {
+        let mut summary = Summary::new();
+        summary.insert(self.key);
+        for (&other, state) in &self.peers {
+            if other != peer && self.is_tree_neighbour(other) {
+                summary.union(&state.beyond);
+            }
+        }
+        summary
+    }
+
+    /// Works out what to say over each tree link, and says it where it changed.
+    fn resummarise(&mut self, out: &mut Vec<Envelope>) {
+        let wanted: Vec<(PublicKey, Option<Summary>)> = self
+            .peers
+            .keys()
+            .map(|&peer| {
+                let summary = self
+                    .is_tree_neighbour(peer)
+                    .then(|| self.summary_beyond(peer));
+                (peer, summary)
+            })
+            .collect();
+        for (peer, summary) in wanted {
+            let Some(state) = self.peers.get_mut(&peer) else {
+                continue;
+            };
+            if state.told == summary {
+                continue;
+            }
+            state.told = summary;
+            if let Some(summary) = summary {
                 out.push(Envelope {
                     to: peer,
-                    message: message.clone(),
+                    message: Message::Summary(summary),
                 });
             }
         }
     }
 
-    fn forward(&mut self, packet: Packet, out: &mut Vec<Envelope>) {
-        if packet.dst == self.key {
-            self.delivered.push(packet);
+    fn forward(&mut self, traffic: Traffic, out: &mut Vec<Envelope>) {
+        if traffic.packet.dst == self.key {
+            self.delivered.push(traffic.packet);
             return;
         }
         // Without a next hop this is a dead end. Ironwood would report the
         // broken path back through the tree and look the destination up again;
         // this core drops the packet, which is that minus the recovery.
-        if let Some(peer) = self.next_hop(&packet.dst) {
+        if let Some(peer) = self.next_hop(&traffic.dst_path) {
             out.push(Envelope {
                 to: peer,
-                message: Message::Packet(packet),
+                message: Message::Traffic(traffic),
             });
         }
     }
 
-    /// The peer to hand a packet for `dst` to, if any is worth handing it to.
+    /// The peer to hand a packet bound for `dst_path` to, if any is worth
+    /// handing it to.
     ///
     /// Only a peer strictly closer to the destination than this node qualifies.
     /// Requiring strict progress is what makes forwarding loop-free without any
     /// per-packet state: distance to the destination falls at every hop and
-    /// cannot fall below zero, so a packet either arrives or is dropped.
+    /// cannot fall below zero, so a packet either arrives or is dropped. The
+    /// destination's path rides along in the packet rather than being looked up
+    /// here, so every node on the route measures against the same target.
     ///
     /// Among the peers that qualify, the cheapest wins: the link's own cost
     /// plus the walk left after crossing it. That sum is exactly what the
     /// packet pays if it follows the tree from there, so it is an upper bound
     /// on the real price, and weighing it is what stops a node posting a packet
     /// down an expensive shortcut to save one cheap hop.
-    fn next_hop(&self, dst: &PublicKey) -> Option<PublicKey> {
-        let dst_path = self.info(dst)?.path();
+    fn next_hop(&self, dst_path: &[Hop]) -> Option<PublicKey> {
         let here = distance(self.announcement.path(), dst_path);
         let mut best: Option<(u64, PublicKey)> = None;
-        for (&peer, &cost) in &self.peers {
+        for (&peer, state) in &self.peers {
             let Some(info) = self.info(&peer) else {
                 continue;
             };
@@ -407,7 +642,7 @@ impl Node {
             if remaining >= here {
                 continue;
             }
-            let total = cost.get().saturating_add(remaining);
+            let total = state.cost.get().saturating_add(remaining);
             if best.is_none_or(|(cheapest, _)| total < cheapest) {
                 best = Some((total, peer));
             }
@@ -439,10 +674,29 @@ mod tests {
         path
     }
 
+    fn announcement(root: u8, steps: &[(u8, u64)]) -> Announcement {
+        Announcement::new(0, path(root, steps)).expect("the test path is well formed")
+    }
+
+    /// What the node at the end of `root` + `steps` says about itself.
     fn announce(root: u8, steps: &[(u8, u64)]) -> Message {
-        Message::Announce(
-            Announcement::new(0, path(root, steps)).expect("the test path is well formed"),
-        )
+        Message::Announce(announcement(root, steps))
+    }
+
+    /// The answer to a search that `here` made itself, arriving back home.
+    fn found(here: u8, root: u8, steps: &[(u8, u64)]) -> Message {
+        Message::Found(Found {
+            announcement: announcement(root, steps),
+            trail: vec![key(here)],
+        })
+    }
+
+    fn summary_of(keys: &[u8]) -> Summary {
+        let mut summary = Summary::new();
+        for &n in keys {
+            summary.insert(key(n));
+        }
+        summary
     }
 
     /// A node linked to a peer holding a smaller key, having just heard where
@@ -458,6 +712,25 @@ mod tests {
         node
     }
 
+    /// The middle of the line `1 - 2 - 3`: the root above, one child below,
+    /// and the child claiming that 3 and 7 lie beyond it.
+    fn middle_of_a_line() -> Node {
+        let mut node = Node::new(0, key(2));
+        node.add_peer(0, key(1), Cost::UNIT);
+        node.add_peer(0, key(3), Cost::UNIT);
+        node.handle(0, key(1), announce(1, &[]));
+        node.handle(0, key(3), announce(1, &[(2, 1), (3, 1)]));
+        node.handle(0, key(3), Message::Summary(summary_of(&[3, 7])));
+        node
+    }
+
+    fn announces(out: &[Envelope]) -> Vec<PublicKey> {
+        out.iter()
+            .filter(|envelope| matches!(envelope.message, Message::Announce(_)))
+            .map(|envelope| envelope.to)
+            .collect()
+    }
+
     #[test]
     fn a_new_node_is_its_own_root() {
         let node = Node::new(0, key(7));
@@ -467,10 +740,10 @@ mod tests {
     }
 
     #[test]
-    fn adding_a_peer_offers_it_everything_known() {
+    fn adding_a_peer_tells_it_where_this_node_sits() {
         let mut node = Node::new(0, key(2));
         let out = node.add_peer(0, key(1), Cost::UNIT);
-        assert_eq!(out.len(), 1, "only its own announcement is known so far");
+        assert_eq!(out.len(), 1, "its own position, and nothing else");
         assert_eq!(out[0].to, key(1));
         assert_eq!(
             out[0].message,
@@ -488,11 +761,7 @@ mod tests {
     #[test]
     fn messages_from_strangers_are_ignored() {
         let mut node = Node::new(0, key(2));
-        let stranger = Announcement::root_of(key(1), 0);
-        assert!(
-            node.handle(0, key(1), Message::Announce(stranger))
-                .is_empty()
-        );
+        assert!(node.handle(0, key(1), announce(1, &[])).is_empty());
         assert_eq!(node.root(), key(2), "the tree did not move");
     }
 
@@ -508,20 +777,41 @@ mod tests {
     fn a_node_keeps_a_smaller_key_than_its_peer() {
         let mut node = Node::new(0, key(1));
         node.add_peer(0, key(2), Cost::UNIT);
-        node.handle(
-            0,
-            key(2),
-            Message::Announce(Announcement::root_of(key(2), 0)),
-        );
+        node.handle(0, key(2), announce(2, &[]));
 
         assert_eq!(node.root(), key(1), "the smaller key stays the root");
         assert_eq!(node.parent(), None);
     }
 
     #[test]
-    fn sending_to_an_unknown_destination_fails() {
+    fn an_announcement_about_anyone_but_its_sender_is_refused() {
+        let mut node = node_below_a_peer(0);
+        // The peer describing some third node. Nothing relays announcements,
+        // so this could only be a mistake or a lie.
+        assert!(node.handle(0, key(1), announce(1, &[(9, 1)])).is_empty());
+        assert_eq!(
+            node.known().collect::<Vec<_>>(),
+            vec![key(1)],
+            "a node hears about its peers and nobody else"
+        );
+    }
+
+    #[test]
+    fn a_stale_announcement_changes_nothing() {
+        let mut node = Node::new(0, key(2));
+        node.add_peer(0, key(1), Cost::UNIT);
+
+        let fresh = Announcement::root_of(key(1), 5);
+        assert!(!node.handle(0, key(1), Message::Announce(fresh)).is_empty());
+
+        let stale = Announcement::root_of(key(1), 4);
+        assert!(node.handle(0, key(1), Message::Announce(stale)).is_empty());
+    }
+
+    #[test]
+    fn sending_to_a_node_that_has_not_been_looked_up_fails() {
         let mut node = Node::new(0, key(1));
-        assert_eq!(node.send(key(9), b"hi".to_vec()), Err(SendError::NoRoute));
+        assert_eq!(node.send(key(9), b"hi".to_vec()), Err(SendError::Unknown));
     }
 
     #[test]
@@ -539,18 +829,23 @@ mod tests {
     }
 
     #[test]
-    fn stale_announcements_are_not_gossiped_on() {
-        let mut node = Node::new(0, key(2));
-        node.add_peer(0, key(1), Cost::UNIT);
-        node.add_peer(0, key(3), Cost::UNIT);
-
-        let fresh = Announcement::root_of(key(1), 5);
-        assert!(!node.handle(0, key(1), Message::Announce(fresh)).is_empty());
-
-        let stale = Announcement::root_of(key(1), 4);
-        assert!(
-            node.handle(0, key(1), Message::Announce(stale)).is_empty(),
-            "old news must not be forwarded, or gossip would never settle"
+    fn a_packet_carries_the_position_it_is_forwarded_by() {
+        let mut node = node_below_a_peer(0);
+        let out = node
+            .send(key(1), b"up".to_vec())
+            .expect("a peer's position is always known");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].to, key(1));
+        assert_eq!(
+            out[0].message,
+            Message::Traffic(Traffic {
+                dst_path: path(1, &[]),
+                packet: Packet {
+                    src: key(2),
+                    dst: key(1),
+                    payload: b"up".to_vec(),
+                },
+            })
         );
     }
 
@@ -564,10 +859,7 @@ mod tests {
         assert_eq!(node.known().count(), 0, "the announcement was forgotten");
         assert_eq!(node.root(), key(2), "and with it, the route to the root");
         assert_eq!(node.parent(), None);
-        assert!(
-            out.iter().any(|envelope| envelope.to == key(1)),
-            "the peer is told this node moved"
-        );
+        assert_eq!(announces(&out), vec![key(1)], "the peer is told it moved");
     }
 
     #[test]
@@ -604,6 +896,27 @@ mod tests {
             node.root(),
             key(2),
             "an echo is not evidence its author is still there"
+        );
+    }
+
+    #[test]
+    fn a_looked_up_position_is_forgotten_like_any_other() {
+        let mut node = Node::new(0, key(5));
+        node.add_peer(0, key(2), Cost::UNIT);
+        node.handle(0, key(2), announce(1, &[(2, 1)]));
+        node.handle(0, key(2), found(5, 1, &[(2, 1), (4, 1)]));
+        assert!(node.known().any(|known| known == key(4)));
+
+        node.tick(Timing::DEFAULT.expiry);
+
+        assert!(
+            !node.known().any(|known| known == key(4)),
+            "nothing reissues an answer, so it goes when its time is up"
+        );
+        assert_eq!(
+            node.send(key(4), b"hi".to_vec()),
+            Err(SendError::Unknown),
+            "and the next packet has to ask again"
         );
     }
 
@@ -663,11 +976,7 @@ mod tests {
         };
         let mut node = Node::with_timing(0, key(2), timing);
         node.add_peer(0, key(1), Cost::UNIT);
-        node.handle(
-            0,
-            key(1),
-            Message::Announce(Announcement::root_of(key(1), 0)),
-        );
+        node.handle(0, key(1), announce(1, &[]));
 
         node.tick(39);
         assert_eq!(node.root(), key(1), "not yet due to expire");
@@ -707,7 +1016,11 @@ mod tests {
 
         assert_eq!(node.parent(), Some(key(2)), "the long way round is cheaper");
         assert_eq!(node.cost_to_root(), 2);
-        assert_eq!(out.len(), 2, "both peers are told where this node moved to");
+        assert_eq!(
+            announces(&out),
+            vec![key(1), key(2)],
+            "both peers are told where this node moved to"
+        );
     }
 
     #[test]
@@ -730,8 +1043,12 @@ mod tests {
         node.add_peer(0, key(3), cost(to_three));
         node.handle(0, key(2), announce(1, &[(2, 1)]));
         node.handle(0, key(3), announce(1, &[(3, 1)]));
-        node.handle(0, key(2), announce(1, &[(2, 1), (4, 1)]));
+        node.handle(0, key(2), found(5, 1, &[(2, 1), (4, 1)]));
         node
+    }
+
+    fn first_hop(out: &[Envelope]) -> PublicKey {
+        out.first().expect("the packet went somewhere").to
     }
 
     #[test]
@@ -741,7 +1058,11 @@ mod tests {
         let out = cheap
             .send(key(4), b"hi".to_vec())
             .expect("a route is known");
-        assert_eq!(out[0].to, key(2), "2 is one cheap hop from the destination");
+        assert_eq!(
+            first_hop(&out),
+            key(2),
+            "2 is one cheap hop from the destination"
+        );
 
         // The same network with that one link made expensive. 2 is still the
         // peer nearest the destination, but reaching it now costs more than
@@ -749,6 +1070,186 @@ mod tests {
         let mut dear = node_choosing_between_two_peers(10, 1);
         assert_eq!(dear.parent(), Some(key(3)));
         let out = dear.send(key(4), b"hi".to_vec()).expect("a route is known");
-        assert_eq!(out[0].to, key(3), "three cheap hops beat one costing ten");
+        assert_eq!(
+            first_hop(&out),
+            key(3),
+            "three cheap hops beat one costing ten"
+        );
+    }
+
+    #[test]
+    fn a_node_summarises_its_own_side_of_each_tree_link() {
+        let node = middle_of_a_line();
+
+        let upwards = node.summary_for(key(1)).expect("the parent is a tree link");
+        assert!(upwards.contains(key(2)), "itself");
+        assert!(upwards.contains(key(3)), "and what its child claimed");
+        assert!(upwards.contains(key(7)), "however far beyond the child");
+    }
+
+    #[test]
+    fn a_summary_leaves_out_what_the_peer_it_goes_to_said() {
+        let node = middle_of_a_line();
+
+        let downwards = node.summary_for(key(3)).expect("the child is a tree link");
+        assert!(downwards.contains(key(2)), "itself");
+        assert!(
+            !downwards.contains(key(3)) && !downwards.contains(key(7)),
+            "handing 3 back its own subtree would put everything on both sides"
+        );
+    }
+
+    #[test]
+    fn a_link_outside_the_tree_carries_no_summary() {
+        let mut node = middle_of_a_line();
+        // A fourth node, linked but sitting elsewhere in the tree: neither this
+        // node's parent nor one of its children.
+        node.add_peer(0, key(8), Cost::UNIT);
+        node.handle(0, key(8), announce(1, &[(6, 1), (8, 1)]));
+
+        assert_eq!(node.summary_for(key(8)), None);
+        assert!(node.summary_for(key(1)).is_some());
+    }
+
+    #[test]
+    fn a_search_goes_only_where_a_summary_admits_it_might_be() {
+        let node = middle_of_a_line();
+
+        let out = node.lookup(key(7));
+        assert_eq!(out.len(), 1, "one branch could hold it");
+        assert_eq!(out[0].to, key(3));
+        assert_eq!(
+            out[0].message,
+            Message::Lookup(Lookup {
+                target: key(7),
+                trail: vec![key(2)],
+            })
+        );
+
+        assert!(
+            node.lookup(key(9)).is_empty(),
+            "no summary admits 9, so nothing is asked"
+        );
+        assert!(
+            node.lookup(key(2)).is_empty(),
+            "and nobody looks for itself"
+        );
+    }
+
+    #[test]
+    fn a_search_is_passed_on_with_this_node_added_to_its_trail() {
+        let mut node = middle_of_a_line();
+        let out = node.handle(
+            0,
+            key(1),
+            Message::Lookup(Lookup {
+                target: key(7),
+                trail: vec![key(1)],
+            }),
+        );
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].to, key(3));
+        assert_eq!(
+            out[0].message,
+            Message::Lookup(Lookup {
+                target: key(7),
+                trail: vec![key(1), key(2)],
+            })
+        );
+    }
+
+    #[test]
+    fn a_search_that_has_been_here_before_is_refused() {
+        let mut node = middle_of_a_line();
+        let out = node.handle(
+            0,
+            key(1),
+            Message::Lookup(Lookup {
+                target: key(7),
+                trail: vec![key(2), key(1)],
+            }),
+        );
+        assert!(out.is_empty(), "a search must not go round in a circle");
+    }
+
+    #[test]
+    fn the_node_being_looked_for_answers_with_where_it_sits() {
+        let mut node = middle_of_a_line();
+        let out = node.handle(
+            0,
+            key(1),
+            Message::Lookup(Lookup {
+                target: key(2),
+                trail: vec![key(1)],
+            }),
+        );
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].to, key(1), "back the way the search came");
+        assert_eq!(
+            out[0].message,
+            Message::Found(Found {
+                announcement: node.announcement.clone(),
+                trail: vec![key(1)],
+            })
+        );
+    }
+
+    #[test]
+    fn an_answer_retraces_the_search_and_stops_where_it_started() {
+        let mut node = middle_of_a_line();
+        let answer = announcement(1, &[(2, 1), (3, 1), (7, 1)]);
+
+        // Passing through: the trail still has the asker on it.
+        let out = node.handle(
+            0,
+            key(3),
+            Message::Found(Found {
+                announcement: answer.clone(),
+                trail: vec![key(1), key(2)],
+            }),
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].to, key(1));
+        assert_eq!(
+            out[0].message,
+            Message::Found(Found {
+                announcement: answer.clone(),
+                trail: vec![key(1)],
+            })
+        );
+        assert!(
+            !node.known().any(|known| known == key(7)),
+            "carrying an answer is not the same as having asked for it"
+        );
+
+        // Arriving home: nothing before this node on the trail.
+        let out = node.handle(
+            0,
+            key(3),
+            Message::Found(Found {
+                announcement: answer,
+                trail: vec![key(2)],
+            }),
+        );
+        assert!(out.is_empty(), "the answer goes no further");
+        assert!(node.known().any(|known| known == key(7)));
+        assert!(node.send(key(7), b"found you".to_vec()).is_ok());
+    }
+
+    #[test]
+    fn an_answer_that_never_came_through_here_is_dropped() {
+        let mut node = middle_of_a_line();
+        let out = node.handle(
+            0,
+            key(3),
+            Message::Found(Found {
+                announcement: announcement(1, &[(2, 1), (3, 1), (7, 1)]),
+                trail: vec![key(1), key(8)],
+            }),
+        );
+        assert!(out.is_empty());
+        assert!(!node.known().any(|known| known == key(7)));
     }
 }

@@ -12,7 +12,7 @@
 
 use std::cell::RefCell;
 
-use blackwood_viewer::sim::{Delivery, Id, Sim, json_string};
+use blackwood_viewer::sim::{Delivery, Id, Search, Sim, json_string};
 
 thread_local! {
     static SIM: RefCell<Sim> = RefCell::new(Sim::new());
@@ -84,6 +84,15 @@ pub extern "C" fn advance(by: u32) {
     respond(with_sim(|sim| {
         sim.advance(u64::from(by));
         Ok(None)
+    }));
+}
+
+/// Asks the network where a node sits, reporting where the search went.
+#[unsafe(no_mangle)]
+pub extern "C" fn lookup(from: u32, to: u32) {
+    respond(with_sim(|sim| {
+        sim.look_up(from as Id, to as Id)
+            .map(|search: Search| Some(search.json_fields()))
     }));
 }
 

@@ -128,6 +128,10 @@ fn run(command: &str, request: &http::Request, sim: &mut Sim) -> Result<Option<S
             sim.advance(request.number::<u64>("by")?);
             Ok(None)
         }
+        "lookup" => {
+            let search = sim.look_up(request.number::<Id>("from")?, request.number::<Id>("to")?)?;
+            Ok(Some(search.json_fields()))
+        }
         "send" => {
             let delivery = sim.send(request.number::<Id>("from")?, request.number::<Id>("to")?)?;
             Ok(Some(delivery.json_fields()))

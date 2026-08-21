@@ -7,6 +7,7 @@
   let error = $state(null);
   let selected = $state([]);
   let flight = $state(null);
+  let search = $state(null);
   let busy = $state(false);
   // What a new link costs to cross, and what re-pricing one sets it to.
   let cost = $state(1);
@@ -40,7 +41,17 @@
 
   async function send() {
     const body = await call('send', { from, to });
-    if (body?.ok) flight = { route: body.route, delivered: body.delivered, at: Date.now() };
+    if (!body?.ok) return;
+    // A sender that did not already hold the destination's position had to
+    // find it first, and the nodes the search touched are worth seeing.
+    search = body.searched?.length ? { visited: body.searched, at: Date.now() } : null;
+    flight = { route: body.route, delivered: body.delivered, at: Date.now() };
+  }
+
+  async function lookUp() {
+    flight = null;
+    const body = await call('lookup', { from, to });
+    if (body?.ok) search = { visited: body.searched, found: body.found, at: Date.now() };
   }
 
   async function removeNode() {
@@ -107,6 +118,13 @@
         Unlink
       </button>
       <span class="divider"></span>
+      <button
+        disabled={to === undefined}
+        title="ask the network where the second node sits, following the summaries on each tree link"
+        onclick={lookUp}
+      >
+        Look up
+      </button>
       <button class="primary" disabled={to === undefined} onclick={send}>
         Send packet
       </button>
@@ -118,7 +136,7 @@
         +5s
       </button>
       <span class="divider"></span>
-      <button onclick={() => { selected = []; flight = null; call('reset'); }}>Reset</button>
+      <button onclick={() => { selected = []; flight = null; search = null; call('reset'); }}>Reset</button>
     </div>
 
     <p class="hint">
@@ -134,12 +152,13 @@
 
     {#if error}<p class="error">{error}</p>{/if}
 
-    <Graph {nodes} {links} {selected} {flight} onpick={pick} />
+    <Graph {nodes} {links} {selected} {flight} {search} onpick={pick} />
 
     <p class="legend">
       <span class="swatch root"></span> root
       <span class="swatch tree"></span> tree link
       <span class="swatch other"></span> other link
+      <span class="swatch searched"></span> searched
       <span class="dim spacer">numbers on links are what they cost to cross</span>
     </p>
   </section>
@@ -148,7 +167,7 @@
     <h2>Nodes</h2>
     <table>
       <thead>
-        <tr><th>id</th><th>root</th><th>parent</th><th>path</th><th title="what the walk from this node up to the root costs">cost</th><th>peers</th><th title="other nodes it holds an announcement for">knows</th></tr>
+        <tr><th>id</th><th>root</th><th>parent</th><th>path</th><th title="what the walk from this node up to the root costs">cost</th><th>peers</th><th title="the positions it holds: its peers, and whoever it has looked up and not yet forgotten">knows</th></tr>
       </thead>
       <tbody>
         {#each nodes as node (node.id)}
@@ -180,6 +199,16 @@
         <li>{line}</li>
       {/each}
     </ol>
+
+    <p class="caveat">
+      No node here knows the network. The <em>knows</em> column counts the
+      positions it holds, and those are its own peers and whoever it has looked
+      up — never everybody. To address a stranger it has to find one first:
+      <strong>Look up</strong> walks the tree, handed on only down the branches
+      whose summary admits the target might be there, and the node being looked
+      for answers by retracing the search's own steps. Watch which nodes it
+      touches, and which it never bothers.
+    </p>
 
     <p class="caveat">
       Every link costs something to cross, and a node sits below whichever peer
@@ -236,7 +265,7 @@
     main { grid-template-columns: minmax(0, 1fr); }
   }
 
-  .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  .controls { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
   .controls .primary { border-color: var(--accent); }
   .controls .cost { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 13px; }
   .controls .cost input { width: 52px; }
@@ -251,6 +280,7 @@
   .legend .swatch:first-child { margin-left: 0; }
   .legend .swatch.root { background: var(--root); height: 10px; width: 10px; border-radius: 50%; }
   .legend .swatch.tree { background: #465060; height: 4px; }
+  .legend .swatch.searched { background: none; border: 2px dashed var(--good); height: 12px; width: 12px; border-radius: 50%; }
 
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
   th { text-align: left; color: var(--dim); font-weight: 500; padding: 3px 6px; }
@@ -259,7 +289,7 @@
   tbody tr:hover { background: #ffffff08; }
   tbody tr.selected { background: #2f3a4d80; }
 
-  .links { display: flex; flex-wrap: wrap; gap: 6px; margin: 0; }
+  .links { display: flex; flex-wrap: wrap; gap: 5px; margin: 0; }
   .link { padding: 2px 7px; border: 1px solid var(--line); border-radius: 20px; color: var(--dim); }
   .link.tree { border-color: #46506080; color: var(--text); }
 

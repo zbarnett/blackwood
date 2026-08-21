@@ -17,11 +17,12 @@ packet find its way.
 ## The core
 
 The node holding the smallest key in a connected component becomes the root.
-Every node announces the path of keys running from that root down to itself and
-gossips what it hears onward. Announcements are only ever authored by the node
-they describe, so the set of them is a conflict-free replicated map whose join
-is simply the greater of two announcements: no coordination, no ordering
-requirements, and no divergence between nodes.
+Every node announces the path of keys running from that root down to itself. An
+announcement crosses one link and stops there: a node needs to know where its
+own peers sit and nothing else, so nothing is relayed and nothing accumulates.
+Announcements are only ever authored by the node they describe, so what a node
+holds about each peer is a max register whose join is simply the greater of the
+two — a repeat, or one that arrives out of order, can be dropped on sight.
 
 The distance between two nodes is the walk up to their lowest common ancestor
 and back down, each link counted at what it costs to cross. A node forwards a
@@ -46,6 +47,33 @@ whose links all cost the same measures distance in hops. Nobody has to agree
 about any of it: each end of a link prices its own end, and a node announces
 what it measured along with where it sits.
 
+The destination's path travels in the packet, since no node along the way holds
+it. That is also what makes the first property exact rather than nearly so:
+every node on the route measures its progress against the same target rather
+than against its own copy of one.
+
+## Finding a node
+
+Addressing a node that is not a peer means finding where it sits first. Each
+node keeps, per tree link, a Bloom filter of the keys reachable through it — a
+fixed few bytes however much lies beyond — built by folding together what its
+*other* tree links told it. Leaving out the link the summary is bound for is
+the whole trick: it makes each one mean "what is on my side of this". It is
+also why summaries cross tree links only, since folded around a cycle they
+would carry every key back to where it came from until each claimed everything.
+
+A search then walks the tree, handed on at each step only to the neighbours
+whose summary admits the target might lie beyond them, and the node being
+looked for answers by retracing the search's own trail. A summary never misses
+a key it holds, so a search cannot overlook the branch its target is really on;
+one that claims a key it does not hold costs a detour and nothing more. As a
+summary fills it prunes less, and in the limit a search is a flood — which is
+what this would be without any of it.
+
+What a node holds is a fixed amount per link, its own position, and the
+positions of the nodes it is currently talking to. Nothing scales with the size
+of the network.
+
 Announcements are soft state. A node reissues its own on a schedule and forgets
 any it has not heard reissued, so a view repairs itself rather than only
 accumulating: a node that vanishes is eventually forgotten instead of lingering
@@ -61,8 +89,8 @@ handed the current instant by its caller, in whatever unit that caller counts
 in. That is what makes a network of them deterministically simulatable, and what
 should make the argument above tractable to check in a proof assistant.
 
-Cryptography and bloom-filter lookups are deliberately absent;
-[`src/lib.rs`](src/lib.rs) records what each one would add.
+Cryptography is deliberately absent; [`src/lib.rs`](src/lib.rs) records what it
+would add.
 
 ## Layout
 
