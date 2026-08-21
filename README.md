@@ -24,8 +24,9 @@ is simply the greater of two announcements: no coordination, no ordering
 requirements, and no divergence between nodes.
 
 The distance between two nodes is the walk up to their lowest common ancestor
-and back down. A node forwards a packet to whichever peer stands strictly closer
-to the destination. Three properties follow, each from a local rule:
+and back down, each link counted at what it costs to cross. A node forwards a
+packet to whichever peer stands strictly closer to the destination. Three
+properties follow, each from a local rule:
 
 - **Loop-free forwarding.** Distance strictly decreases at every hop and is
   bounded below by zero, so a packet cannot revisit a node.
@@ -33,7 +34,17 @@ to the destination. Three properties follow, each from a local rule:
   to sit below a path that already runs through it. Staleness can cost a node
   its route, never its acyclicity.
 - **Delivery on a settled tree.** A node's tree neighbour towards the
-  destination is always exactly one hop closer, so there is always a next hop.
+  destination is always closer by exactly what the link between them costs, so
+  there is always a next hop.
+
+Both decisions weigh what a link costs — latency, in ironwood; whatever the
+caller measures, here. A node sits below the peer offering the cheapest walk to
+the root rather than the shortest one, and among the peers that make strict
+progress it hands a packet to whichever leaves the least left to pay. A cost is
+never zero, which is what keeps the two properties above standing; a network
+whose links all cost the same measures distance in hops. Nobody has to agree
+about any of it: each end of a link prices its own end, and a node announces
+what it measured along with where it sits.
 
 Announcements are soft state. A node reissues its own on a schedule and forgets
 any it has not heard reissued, so a view repairs itself rather than only
@@ -50,7 +61,7 @@ handed the current instant by its caller, in whatever unit that caller counts
 in. That is what makes a network of them deterministically simulatable, and what
 should make the argument above tractable to check in a proof assistant.
 
-Cryptography, bloom-filter lookups and link costs are deliberately absent;
+Cryptography and bloom-filter lookups are deliberately absent;
 [`src/lib.rs`](src/lib.rs) records what each one would add.
 
 ## Layout

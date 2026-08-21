@@ -1,12 +1,12 @@
 //! The per-node routing state machine.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::key::PublicKey;
 use crate::message::{Envelope, Message, Packet};
-use crate::tree::{Announcement, distance};
+use crate::tree::{Announcement, Cost, Hop, distance};
 
 /// Why a packet could not be handed to the network.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -86,8 +86,8 @@ pub struct Node {
     announcement: Announcement,
     /// When this node last issued the announcement above.
     announced_at: u64,
-    /// Peers reachable over a direct link.
-    peers: BTreeSet<PublicKey>,
+    /// Peers reachable over a direct link, and what each link costs.
+    peers: BTreeMap<PublicKey, Cost>,
     /// What this node has heard about every *other* node, and when.
     infos: BTreeMap<PublicKey, Info>,
     delivered: Vec<Packet>,
@@ -107,7 +107,7 @@ impl Node {
             timing,
             announcement: Announcement::root_of(key, 0),
             announced_at: now,
-            peers: BTreeSet::new(),
+            peers: BTreeMap::new(),
             infos: BTreeMap::new(),
             delivered: Vec::new(),
         }
@@ -133,14 +133,19 @@ impl Node {
         self.announcement.parent()
     }
 
-    /// The path of keys from the root down to this node.
-    pub fn path(&self) -> &[PublicKey] {
+    /// The path from the root down to this node, priced link by link.
+    pub fn path(&self) -> &[Hop] {
         self.announcement.path()
     }
 
-    /// The peers this node holds a link to.
-    pub fn peers(&self) -> impl Iterator<Item = PublicKey> + '_ {
-        self.peers.iter().copied()
+    /// What the walk from this node up to the root costs.
+    pub fn cost_to_root(&self) -> u64 {
+        self.announcement.cost_to_root()
+    }
+
+    /// The peers this node holds a link to, and what each link costs.
+    pub fn peers(&self) -> impl Iterator<Item = (PublicKey, Cost)> + '_ {
+        self.peers.iter().map(|(&peer, &cost)| (peer, cost))
     }
 
     /// The other nodes this one currently holds an announcement for.
@@ -176,22 +181,36 @@ impl Node {
         out
     }
 
-    /// Brings up a link to `peer`.
+    /// Brings up a link to `peer`, costing `cost` to cross.
     ///
     /// The new peer is sent everything this node knows, which is what makes a
     /// fresh link converge without any separate handshake.
-    pub fn add_peer(&mut self, now: u64, peer: PublicKey) -> Vec<Envelope> {
+    ///
+    /// Calling this for a link that is already up re-prices it instead, which
+    /// is how a caller that keeps measuring its links reports what it found.
+    /// Nothing is resent: the peer already has everything, and what changed is
+    /// only this node's own view of what reaching it costs.
+    pub fn add_peer(&mut self, now: u64, peer: PublicKey, cost: Cost) -> Vec<Envelope> {
         let mut out = Vec::new();
-        if peer == self.key || !self.peers.insert(peer) {
+        if peer == self.key {
             return out;
         }
-        for info in self.announcements() {
-            out.push(Envelope {
-                to: peer,
-                message: Message::Announce(info.clone()),
-            });
+        match self.peers.insert(peer, cost) {
+            Some(previous) => {
+                if previous != cost {
+                    self.reparent(now, &mut out);
+                }
+            }
+            None => {
+                for info in self.announcements() {
+                    out.push(Envelope {
+                        to: peer,
+                        message: Message::Announce(info.clone()),
+                    });
+                }
+                self.reparent(now, &mut out);
+            }
         }
-        self.reparent(now, &mut out);
         out
     }
 
@@ -204,7 +223,7 @@ impl Node {
     /// node fails by dropping the packet at the dead end.
     pub fn remove_peer(&mut self, now: u64, peer: PublicKey) -> Vec<Envelope> {
         let mut out = Vec::new();
-        if self.peers.remove(&peer) {
+        if self.peers.remove(&peer).is_some() {
             self.reparent(now, &mut out);
         }
         out
@@ -215,7 +234,7 @@ impl Node {
     /// Messages from a node that is not a peer are ignored.
     pub fn handle(&mut self, now: u64, from: PublicKey, message: Message) -> Vec<Envelope> {
         let mut out = Vec::new();
-        if !self.peers.contains(&from) {
+        if !self.peers.contains_key(&from) {
             return out;
         }
         match message {
@@ -323,11 +342,11 @@ impl Node {
         // stamps the winner with the right one.
         let seq = self.announcement.seq();
         let mut best = Announcement::root_of(self.key, seq);
-        for peer in &self.peers {
+        for (peer, &cost) in &self.peers {
             let Some(info) = self.info(peer) else {
                 continue;
             };
-            let Some(candidate) = info.extend(self.key, seq) else {
+            let Some(candidate) = info.extend(self.key, cost, seq) else {
                 continue;
             };
             if candidate.preference_cmp(&best) == Ordering::Less {
@@ -338,7 +357,7 @@ impl Node {
     }
 
     fn gossip(&self, message: Message, except: Option<PublicKey>, out: &mut Vec<Envelope>) {
-        for &peer in &self.peers {
+        for &peer in self.peers.keys() {
             if Some(peer) != except {
                 out.push(Envelope {
                     to: peer,
@@ -364,26 +383,36 @@ impl Node {
         }
     }
 
-    /// The peer that stands strictly closer to `dst`, if one does.
+    /// The peer to hand a packet for `dst` to, if any is worth handing it to.
     ///
+    /// Only a peer strictly closer to the destination than this node qualifies.
     /// Requiring strict progress is what makes forwarding loop-free without any
     /// per-packet state: distance to the destination falls at every hop and
     /// cannot fall below zero, so a packet either arrives or is dropped.
+    ///
+    /// Among the peers that qualify, the cheapest wins: the link's own cost
+    /// plus the walk left after crossing it. That sum is exactly what the
+    /// packet pays if it follows the tree from there, so it is an upper bound
+    /// on the real price, and weighing it is what stops a node posting a packet
+    /// down an expensive shortcut to save one cheap hop.
     fn next_hop(&self, dst: &PublicKey) -> Option<PublicKey> {
         let dst_path = self.info(dst)?.path();
-        let mut shortest = distance(self.announcement.path(), dst_path);
-        let mut best = None;
-        for &peer in &self.peers {
+        let here = distance(self.announcement.path(), dst_path);
+        let mut best: Option<(u64, PublicKey)> = None;
+        for (&peer, &cost) in &self.peers {
             let Some(info) = self.info(&peer) else {
                 continue;
             };
-            let hop = distance(info.path(), dst_path);
-            if hop < shortest {
-                shortest = hop;
-                best = Some(peer);
+            let remaining = distance(info.path(), dst_path);
+            if remaining >= here {
+                continue;
+            }
+            let total = cost.get().saturating_add(remaining);
+            if best.is_none_or(|(cheapest, _)| total < cheapest) {
+                best = Some((total, peer));
             }
         }
-        best
+        best.map(|(_, peer)| peer)
     }
 }
 
@@ -396,11 +425,31 @@ mod tests {
         PublicKey::new([n; KEY_LEN])
     }
 
+    fn cost(n: u64) -> Cost {
+        Cost::new(n).expect("a test cost is never zero")
+    }
+
+    /// A path rooted at `root`, each later node reached over a link of the cost
+    /// written beside it.
+    fn path(root: u8, steps: &[(u8, u64)]) -> Vec<Hop> {
+        let mut path = vec![Hop::root(key(root))];
+        for &(node, price) in steps {
+            path.push(Hop::new(key(node), cost(price)));
+        }
+        path
+    }
+
+    fn announce(root: u8, steps: &[(u8, u64)]) -> Message {
+        Message::Announce(
+            Announcement::new(0, path(root, steps)).expect("the test path is well formed"),
+        )
+    }
+
     /// A node linked to a peer holding a smaller key, having just heard where
     /// that peer sits, so it has taken up a position below it.
     fn node_below_a_peer(now: u64) -> Node {
         let mut node = Node::new(0, key(2));
-        node.add_peer(0, key(1));
+        node.add_peer(0, key(1), Cost::UNIT);
         node.handle(
             now,
             key(1),
@@ -414,13 +463,13 @@ mod tests {
         let node = Node::new(0, key(7));
         assert_eq!(node.root(), key(7));
         assert_eq!(node.parent(), None);
-        assert_eq!(node.path(), [key(7)]);
+        assert_eq!(node.path(), path(7, &[]));
     }
 
     #[test]
     fn adding_a_peer_offers_it_everything_known() {
         let mut node = Node::new(0, key(2));
-        let out = node.add_peer(0, key(1));
+        let out = node.add_peer(0, key(1), Cost::UNIT);
         assert_eq!(out.len(), 1, "only its own announcement is known so far");
         assert_eq!(out[0].to, key(1));
         assert_eq!(
@@ -432,7 +481,7 @@ mod tests {
     #[test]
     fn a_node_will_not_peer_with_itself() {
         let mut node = Node::new(0, key(1));
-        assert!(node.add_peer(0, key(1)).is_empty());
+        assert!(node.add_peer(0, key(1), Cost::UNIT).is_empty());
         assert_eq!(node.peers().count(), 0);
     }
 
@@ -452,13 +501,13 @@ mod tests {
         let node = node_below_a_peer(0);
         assert_eq!(node.root(), key(1));
         assert_eq!(node.parent(), Some(key(1)));
-        assert_eq!(node.path(), [key(1), key(2)]);
+        assert_eq!(node.path(), path(1, &[(2, 1)]));
     }
 
     #[test]
     fn a_node_keeps_a_smaller_key_than_its_peer() {
         let mut node = Node::new(0, key(1));
-        node.add_peer(0, key(2));
+        node.add_peer(0, key(2), Cost::UNIT);
         node.handle(
             0,
             key(2),
@@ -492,8 +541,8 @@ mod tests {
     #[test]
     fn stale_announcements_are_not_gossiped_on() {
         let mut node = Node::new(0, key(2));
-        node.add_peer(0, key(1));
-        node.add_peer(0, key(3));
+        node.add_peer(0, key(1), Cost::UNIT);
+        node.add_peer(0, key(3), Cost::UNIT);
 
         let fresh = Announcement::root_of(key(1), 5);
         assert!(!node.handle(0, key(1), Message::Announce(fresh)).is_empty());
@@ -562,7 +611,7 @@ mod tests {
     fn a_node_reissues_its_own_announcement_on_schedule() {
         let refresh = Timing::DEFAULT.refresh;
         let mut node = Node::new(0, key(1));
-        node.add_peer(0, key(2));
+        node.add_peer(0, key(2), Cost::UNIT);
 
         assert!(node.tick(refresh - 1).is_empty(), "not due yet");
 
@@ -574,7 +623,11 @@ mod tests {
             Message::Announce(Announcement::root_of(key(1), 1)),
             "a fresh sequence number on an unchanged path"
         );
-        assert_eq!(node.path(), [key(1)], "reissuing does not move the tree");
+        assert_eq!(
+            node.path(),
+            path(1, &[]),
+            "reissuing does not move the tree"
+        );
     }
 
     #[test]
@@ -609,7 +662,7 @@ mod tests {
             expiry: 40,
         };
         let mut node = Node::with_timing(0, key(2), timing);
-        node.add_peer(0, key(1));
+        node.add_peer(0, key(1), Cost::UNIT);
         node.handle(
             0,
             key(1),
@@ -620,5 +673,82 @@ mod tests {
         assert_eq!(node.root(), key(1), "not yet due to expire");
         node.tick(40);
         assert_eq!(node.root(), key(2), "expired on the caller's own scale");
+    }
+
+    #[test]
+    fn a_node_sits_below_whichever_peer_offers_the_cheapest_walk_to_the_root() {
+        let mut node = Node::new(0, key(4));
+        node.add_peer(0, key(1), cost(10));
+        node.add_peer(0, key(2), cost(1));
+        node.handle(0, key(1), announce(1, &[]));
+        node.handle(0, key(2), announce(1, &[(2, 1)]));
+
+        assert_eq!(node.root(), key(1));
+        assert_eq!(
+            node.parent(),
+            Some(key(2)),
+            "two cheap links beat one expensive one, though the root is a peer"
+        );
+        assert_eq!(node.path(), path(1, &[(2, 1), (4, 1)]));
+        assert_eq!(node.cost_to_root(), 2);
+    }
+
+    #[test]
+    fn re_pricing_a_link_moves_a_node() {
+        let mut node = Node::new(0, key(4));
+        node.add_peer(0, key(1), Cost::UNIT);
+        node.add_peer(0, key(2), Cost::UNIT);
+        node.handle(0, key(1), announce(1, &[]));
+        node.handle(0, key(2), announce(1, &[(2, 1)]));
+        assert_eq!(node.parent(), Some(key(1)), "one hop to the root");
+
+        // The caller measures that link again and finds it much worse.
+        let out = node.add_peer(1, key(1), cost(10));
+
+        assert_eq!(node.parent(), Some(key(2)), "the long way round is cheaper");
+        assert_eq!(node.cost_to_root(), 2);
+        assert_eq!(out.len(), 2, "both peers are told where this node moved to");
+    }
+
+    #[test]
+    fn re_pricing_a_link_to_what_it_already_cost_changes_nothing() {
+        let mut node = node_below_a_peer(0);
+        let before = node.path().to_vec();
+
+        assert!(
+            node.add_peer(1, key(1), Cost::UNIT).is_empty(),
+            "nothing changed, so there is nothing to say"
+        );
+        assert_eq!(node.path(), before);
+    }
+
+    /// A node holding key 5, linked to both 2 and 3 — each of them a child of
+    /// the root — and told that 4 sits below 2, away from 3.
+    fn node_choosing_between_two_peers(to_two: u64, to_three: u64) -> Node {
+        let mut node = Node::new(0, key(5));
+        node.add_peer(0, key(2), cost(to_two));
+        node.add_peer(0, key(3), cost(to_three));
+        node.handle(0, key(2), announce(1, &[(2, 1)]));
+        node.handle(0, key(3), announce(1, &[(3, 1)]));
+        node.handle(0, key(2), announce(1, &[(2, 1), (4, 1)]));
+        node
+    }
+
+    #[test]
+    fn a_packet_crosses_a_shortcut_only_while_it_is_worth_crossing() {
+        let mut cheap = node_choosing_between_two_peers(1, 2);
+        assert_eq!(cheap.parent(), Some(key(2)));
+        let out = cheap
+            .send(key(4), b"hi".to_vec())
+            .expect("a route is known");
+        assert_eq!(out[0].to, key(2), "2 is one cheap hop from the destination");
+
+        // The same network with that one link made expensive. 2 is still the
+        // peer nearest the destination, but reaching it now costs more than
+        // walking the tree the long way round.
+        let mut dear = node_choosing_between_two_peers(10, 1);
+        assert_eq!(dear.parent(), Some(key(3)));
+        let out = dear.send(key(4), b"hi".to_vec()).expect("a route is known");
+        assert_eq!(out[0].to, key(3), "three cheap hops beat one costing ten");
     }
 }

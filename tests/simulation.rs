@@ -7,10 +7,14 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use blackwood::{KEY_LEN, Message, Node, Packet, PublicKey, SendError, Timing};
+use blackwood::{Cost, Hop, KEY_LEN, Message, Node, Packet, PublicKey, SendError, Timing};
 
 fn key(n: u8) -> PublicKey {
     PublicKey::new([n; KEY_LEN])
+}
+
+fn cost(n: u64) -> Cost {
+    Cost::new(n).expect("a test cost is never zero")
 }
 
 /// A message in flight, from one node to a linked peer.
@@ -47,11 +51,15 @@ impl Network {
         self.nodes.get_mut(&key).expect("node is in the network")
     }
 
-    /// Brings up a bidirectional link between two nodes.
-    fn link(&mut self, a: PublicKey, b: PublicKey) {
+    /// Brings up a bidirectional link between two nodes, costing the same to
+    /// cross from either end.
+    ///
+    /// Called for a link that is already up, it re-prices it instead — the
+    /// caller of a real node does this whenever it measures a peering again.
+    fn link(&mut self, a: PublicKey, b: PublicKey, cost: Cost) {
         let now = self.now;
         for (near, far) in [(a, b), (b, a)] {
-            let outbound = self.node_mut(near).add_peer(now, far);
+            let outbound = self.node_mut(near).add_peer(now, far, cost);
             self.enqueue(near, outbound);
         }
     }
@@ -118,13 +126,57 @@ impl Network {
     }
 
     /// Where every node believes it sits, for comparing one moment to another.
-    fn positions(&self, keys: &[PublicKey]) -> Vec<(PublicKey, Option<PublicKey>, Vec<PublicKey>)> {
+    fn positions(&self, keys: &[PublicKey]) -> Vec<(PublicKey, Option<PublicKey>, Vec<Hop>)> {
         keys.iter()
             .map(|&key| {
                 let node = self.node(key);
                 (node.root(), node.parent(), node.path().to_vec())
             })
             .collect()
+    }
+
+    /// Checks the invariant greedy forwarding rests on: every node's path is
+    /// its parent's path with one hop more on the end, priced at what that
+    /// node measured the link to its parent to cost.
+    fn paths_agree_with_parents(&self, keys: &[PublicKey]) {
+        for &key in keys {
+            let node = self.node(key);
+            let Some(parent) = node.parent() else {
+                assert_eq!(node.path(), [Hop::root(key)], "a root's path is itself");
+                continue;
+            };
+            let (_, cost) = node
+                .peers()
+                .find(|(peer, _)| *peer == parent)
+                .expect("a node's parent is one of its peers");
+            let (head, tail) = node.path().split_at(node.path().len() - 1);
+            assert_eq!(head, self.node(parent).path(), "path disagrees with parent");
+            assert_eq!(tail, [Hop::new(key, cost)]);
+        }
+    }
+
+    /// Sends one packet between every ordered pair of nodes and checks that
+    /// each one arrives where it was addressed.
+    fn everyone_reaches_everyone(&mut self, keys: &[PublicKey]) {
+        for &src in keys {
+            for &dst in keys {
+                if src == dst {
+                    continue;
+                }
+                let payload = vec![src.as_bytes()[0], dst.as_bytes()[0]];
+                let outbound = self
+                    .node_mut(src)
+                    .send(dst, payload.clone())
+                    .unwrap_or_else(|error| panic!("{src:?} has no route to {dst:?}: {error}"));
+                self.enqueue(src, outbound);
+                self.run();
+
+                assert_eq!(
+                    self.node_mut(dst).take_delivered(),
+                    vec![Packet { src, dst, payload }]
+                );
+            }
+        }
     }
 }
 
@@ -138,19 +190,45 @@ impl Network {
 ///           e
 /// ```
 ///
-/// The `b - d` link gives `d` a shorter path to the root than going through
-/// `c`, so the tree that forms is not simply the order the links came up in,
-/// and the cycle `b - c - d` gives a wrong implementation somewhere to loop.
+/// Every link costs the same, so distance here is counted in hops. The
+/// `b - d` link gives `d` a shorter path to the root than going through `c`,
+/// so the tree that forms is not simply the order the links came up in, and
+/// the cycle `b - c - d` gives a wrong implementation somewhere to loop.
 fn ring_with_a_tail() -> (Network, [PublicKey; 5]) {
     let keys = [key(1), key(2), key(3), key(4), key(5)];
     let [a, b, c, d, e] = keys;
 
     let mut net = Network::new(keys);
-    net.link(a, b);
-    net.link(b, c);
-    net.link(c, d);
-    net.link(b, d);
-    net.link(d, e);
+    for (near, far) in [(a, b), (b, c), (c, d), (b, d), (d, e)] {
+        net.link(near, far, Cost::UNIT);
+    }
+    (net, keys)
+}
+
+/// The same topology, with the `b - d` link made expensive:
+///
+/// ```text
+///     a -1- b -1- c
+///           |     |
+///           5     1
+///           |     |
+///           d --- +
+///           |
+///           1
+///           |
+///           e
+/// ```
+///
+/// Every shortest path by hop count still runs over `b - d`, and every cheapest
+/// one avoids it, so the two metrics disagree everywhere it matters.
+fn ring_with_one_expensive_link() -> (Network, [PublicKey; 5]) {
+    let keys = [key(1), key(2), key(3), key(4), key(5)];
+    let [a, b, c, d, e] = keys;
+
+    let mut net = Network::new(keys);
+    for (near, far, price) in [(a, b, 1), (b, c, 1), (c, d, 1), (b, d, 5), (d, e, 1)] {
+        net.link(near, far, cost(price));
+    }
     (net, keys)
 }
 
@@ -175,15 +253,7 @@ fn brings_up_a_network_and_carries_a_packet_across_it() {
     );
     assert_eq!(net.node(e).parent(), Some(d));
 
-    // Each node's path is its parent's path with itself appended, which is the
-    // consistency greedy forwarding relies on.
-    for node in [b, c, d, e] {
-        let path = net.node(node).path();
-        let parent = net.node(node).parent().expect("only a is the root");
-        let (head, tail) = path.split_at(path.len() - 1);
-        assert_eq!(head, net.node(parent).path(), "path disagrees with parent");
-        assert_eq!(tail, [node]);
-    }
+    net.paths_agree_with_parents(&[a, b, c, d, e]);
 
     // One packet, from the root down to the far end of the tail.
     let outbound = net
@@ -214,29 +284,110 @@ fn brings_up_a_network_and_carries_a_packet_across_it() {
 fn every_node_can_reach_every_other() {
     let (mut net, keys) = ring_with_a_tail();
     net.run();
+    net.everyone_reaches_everyone(&keys);
+}
 
-    for src in keys {
-        for dst in keys {
-            if src == dst {
-                continue;
-            }
-            let outbound = net
-                .node_mut(src)
-                .send(dst, vec![src.as_bytes()[0], dst.as_bytes()[0]])
-                .unwrap_or_else(|error| panic!("{src:?} has no route to {dst:?}: {error}"));
-            net.enqueue(src, outbound);
-            net.run();
+#[test]
+fn every_node_can_reach_every_other_over_priced_links() {
+    let (mut net, keys) = ring_with_one_expensive_link();
+    net.run();
+    net.everyone_reaches_everyone(&keys);
+}
 
-            assert_eq!(
-                net.node_mut(dst).take_delivered(),
-                vec![Packet {
-                    src,
-                    dst,
-                    payload: vec![src.as_bytes()[0], dst.as_bytes()[0]],
-                }]
-            );
-        }
+#[test]
+fn the_cheapest_walk_wins_over_the_shortest_one() {
+    let (mut net, [a, b, c, d, e]) = ring_with_one_expensive_link();
+
+    net.run();
+
+    for node in [a, b, c, d, e] {
+        assert_eq!(net.node(node).root(), a, "disagreement about the root");
     }
+    assert_eq!(
+        net.node(d).parent(),
+        Some(c),
+        "one link costing 5 is worse than two costing 1 apiece"
+    );
+    assert_eq!(net.node(d).cost_to_root(), 3);
+    assert_eq!(net.node(e).parent(), Some(d));
+    assert_eq!(net.node(e).cost_to_root(), 4);
+    net.paths_agree_with_parents(&[a, b, c, d, e]);
+
+    // The same packet the unit-cost network carries in three hops. Here it
+    // takes four, and pays 4 rather than the 7 the short way would have cost.
+    let outbound = net
+        .node_mut(a)
+        .send(e, b"the long way round".to_vec())
+        .expect("the route is known once the tree has settled");
+    net.enqueue(a, outbound);
+    net.run();
+
+    assert_eq!(
+        net.node_mut(e).take_delivered(),
+        vec![Packet {
+            src: a,
+            dst: e,
+            payload: b"the long way round".to_vec(),
+        }]
+    );
+    assert_eq!(net.hops, 4, "expected a -> b -> c -> d -> e");
+}
+
+#[test]
+fn a_packet_refuses_an_expensive_shortcut() {
+    let (mut net, [_a, b, c, d, e]) = ring_with_one_expensive_link();
+    net.run();
+
+    // b holds a link straight to d, which is one hop from the destination.
+    // Crossing it costs 5, where walking the tree by way of c costs 3.
+    assert!(net.node(b).peers().any(|(peer, _)| peer == d));
+
+    let outbound = net
+        .node_mut(b)
+        .send(e, b"not that way".to_vec())
+        .expect("the route is known");
+    net.enqueue(b, outbound);
+    net.run();
+
+    assert!(!net.node_mut(e).take_delivered().is_empty());
+    assert_eq!(net.hops, 3, "expected b -> c -> d -> e, not b -> d -> e");
+    assert!(
+        net.node_mut(c).take_delivered().is_empty(),
+        "c carried the packet, it was not addressed to it"
+    );
+}
+
+#[test]
+fn re_pricing_a_link_reshapes_the_tree() {
+    let (mut net, [a, b, c, d, e]) = ring_with_one_expensive_link();
+    net.run();
+    assert_eq!(net.node(d).parent(), Some(c));
+
+    // The link is measured again and turns out to be as good as any other,
+    // which is the same call that brought it up in the first place.
+    net.link(b, d, Cost::UNIT);
+    net.run();
+
+    assert_eq!(
+        net.node(d).parent(),
+        Some(b),
+        "the direct link is now cheapest"
+    );
+    assert_eq!(net.node(d).cost_to_root(), 2);
+    assert_eq!(net.node(e).cost_to_root(), 3);
+    net.paths_agree_with_parents(&[a, b, c, d, e]);
+
+    // c re-parents nowhere — it was already below b — but the route to e
+    // through the network has moved onto the link that just got cheaper.
+    assert_eq!(net.node(c).parent(), Some(b));
+    let outbound = net
+        .node_mut(a)
+        .send(e, b"straight through".to_vec())
+        .expect("route");
+    net.enqueue(a, outbound);
+    net.run();
+    assert!(!net.node_mut(e).take_delivered().is_empty());
+    assert_eq!(net.hops, 3, "expected a -> b -> d -> e");
 }
 
 #[test]
@@ -247,13 +398,13 @@ fn a_link_coming_up_late_is_absorbed() {
     // Bring up a single link. b holds the smaller of the two keys present, so
     // the pair roots on b.
     let mut net = Network::new(keys);
-    net.link(c, b);
+    net.link(c, b, Cost::UNIT);
     net.run();
     assert_eq!(net.node(c).root(), b);
     assert_eq!(net.node(c).parent(), Some(b));
 
     // a joins, holding a smaller key, and the tree re-roots onto it.
-    net.link(a, b);
+    net.link(a, b, Cost::UNIT);
     net.run();
 
     for node in [a, b, c] {
@@ -335,7 +486,7 @@ fn a_node_that_starts_over_rejoins_the_tree() {
     // at zero. Without expiry that announcement would look like ancient news
     // and every node would go on routing towards where e used to be.
     net.nodes.insert(e, Node::new(net.now, e));
-    net.link(d, e);
+    net.link(d, e, Cost::UNIT);
     net.run();
 
     assert_eq!(

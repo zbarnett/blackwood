@@ -1,6 +1,7 @@
 <script>
   // The network drawn as a graph: nodes on a circle, links between them.
-  // Tree links (a node and its parent) are solid, every other link is dashed.
+  // Tree links (a node and its parent) are solid, every other link is dashed,
+  // and each carries the cost of crossing it.
   let { nodes, links, selected, flight, onpick } = $props();
 
   const WIDTH = 760;
@@ -87,6 +88,21 @@
     {/if}
   {/each}
 
+  <!-- Costs go on afterwards so no line is drawn across a label. -->
+  {#each links as link (link.a + '-' + link.b)}
+    {@const from = positions.get(link.a)}
+    {@const to = positions.get(link.b)}
+    {#if from && to}
+      <text
+        class="cost"
+        class:tree={link.tree}
+        x={(from.x + to.x) / 2}
+        y={(from.y + to.y) / 2}
+        dy="0.32em"
+      >{link.cost}</text>
+    {/if}
+  {/each}
+
   {#each nodes as node (node.id)}
     {@const at = positions.get(node.id)}
     {#if at}
@@ -139,6 +155,17 @@
   line.lit {
     stroke: var(--accent);
   }
+
+  text.cost {
+    fill: var(--dim);
+    font: 500 12px ui-monospace, Menlo, monospace;
+    /* A halo, so a cost sitting on its own link stays readable. */
+    stroke: var(--panel);
+    stroke-width: 4;
+    paint-order: stroke;
+  }
+
+  text.cost.tree { fill: var(--text); }
 
   .node circle {
     fill: #262b34;

@@ -52,11 +52,21 @@ pub extern "C" fn node_remove(id: u32) {
     respond(with_sim(|sim| sim.remove_node(id as Id).map(|()| None)));
 }
 
-/// Brings up a link.
+/// Brings up a link, costing `cost` to cross.
 #[unsafe(no_mangle)]
-pub extern "C" fn link_add(a: u32, b: u32) {
+pub extern "C" fn link_add(a: u32, b: u32, cost: u32) {
     respond(with_sim(|sim| {
-        sim.add_link(a as Id, b as Id).map(|()| None)
+        sim.add_link(a as Id, b as Id, u64::from(cost))
+            .map(|()| None)
+    }));
+}
+
+/// Re-prices a link that is already up.
+#[unsafe(no_mangle)]
+pub extern "C" fn link_cost(a: u32, b: u32, cost: u32) {
+    respond(with_sim(|sim| {
+        sim.set_link_cost(a as Id, b as Id, u64::from(cost))
+            .map(|()| None)
     }));
 }
 

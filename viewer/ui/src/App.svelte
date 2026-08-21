@@ -8,6 +8,8 @@
   let selected = $state([]);
   let flight = $state(null);
   let busy = $state(false);
+  // What a new link costs to cross, and what re-pricing one sets it to.
+  let cost = $state(1);
 
   const from = $derived(selected[0]);
   const to = $derived(selected[1]);
@@ -91,8 +93,15 @@
         Remove {from ?? 'node'}
       </button>
       <span class="divider"></span>
-      <button disabled={to === undefined} onclick={() => call('link/add', { a: from, b: to })}>
+      <label class="cost" title="what the link costs to cross — a node prefers the cheapest walk to the root, not the shortest">
+        cost
+        <input type="number" min="1" max="99" bind:value={cost} />
+      </label>
+      <button disabled={to === undefined} onclick={() => call('link/add', { a: from, b: to, cost })}>
         Link
+      </button>
+      <button disabled={to === undefined} onclick={() => call('link/cost', { a: from, b: to, cost })}>
+        Re-price
       </button>
       <button disabled={to === undefined} onclick={() => call('link/remove', { a: from, b: to })}>
         Unlink
@@ -131,6 +140,7 @@
       <span class="swatch root"></span> root
       <span class="swatch tree"></span> tree link
       <span class="swatch other"></span> other link
+      <span class="dim spacer">numbers on links are what they cost to cross</span>
     </p>
   </section>
 
@@ -138,7 +148,7 @@
     <h2>Nodes</h2>
     <table>
       <thead>
-        <tr><th>id</th><th>root</th><th>parent</th><th>path</th><th>peers</th><th title="other nodes it holds an announcement for">knows</th></tr>
+        <tr><th>id</th><th>root</th><th>parent</th><th>path</th><th title="what the walk from this node up to the root costs">cost</th><th>peers</th><th title="other nodes it holds an announcement for">knows</th></tr>
       </thead>
       <tbody>
         {#each nodes as node (node.id)}
@@ -147,6 +157,7 @@
             <td>{node.root}</td>
             <td>{node.parent ?? '—'}</td>
             <td class="mono">{node.path.join('·')}</td>
+            <td class="mono">{node.cost}</td>
             <td class="mono">{node.peers.join(' ') || '—'}</td>
             <td class="mono">{node.knows}</td>
           </tr>
@@ -157,7 +168,7 @@
     <h2>Links <span class="dim">{links.length}</span></h2>
     <p class="links mono">
       {#each links as link (link.a + '-' + link.b)}
-        <span class="link" class:tree={link.tree}>{link.a}–{link.b}</span>
+        <span class="link" class:tree={link.tree}>{link.a}–{link.b}<span class="dim">&nbsp;{link.cost}</span></span>
       {:else}
         <span class="dim">none</span>
       {/each}
@@ -169,6 +180,14 @@
         <li>{line}</li>
       {/each}
     </ol>
+
+    <p class="caveat">
+      Every link costs something to cross, and a node sits below whichever peer
+      offers it the cheapest walk to the root rather than the shortest one.
+      <code>2–4</code> starts out costing 5, which is why <code>4</code> hangs off
+      <code>3</code> the long way round; re-price it to 1 and watch the tree
+      snap back.
+    </p>
 
     <p class="caveat">
       Announcements are soft state: a node reissues its own every second and
@@ -219,12 +238,15 @@
 
   .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
   .controls .primary { border-color: var(--accent); }
+  .controls .cost { display: flex; align-items: center; gap: 6px; color: var(--dim); font-size: 13px; }
+  .controls .cost input { width: 52px; }
   .divider { width: 1px; height: 20px; background: var(--line); }
 
   .hint { color: var(--dim); font-size: 13px; margin: 10px 0; min-height: 20px; }
   .error { color: var(--bad); margin: 8px 0; }
 
   .legend { display: flex; align-items: center; gap: 7px; color: var(--dim); font-size: 12px; margin: 10px 2px; }
+  .legend .spacer { margin-left: 18px; font-size: 12px; }
   .legend .swatch { width: 15px; height: 3px; border-radius: 2px; background: var(--line); margin-left: 12px; }
   .legend .swatch:first-child { margin-left: 0; }
   .legend .swatch.root { background: var(--root); height: 10px; width: 10px; border-radius: 50%; }
@@ -246,4 +268,5 @@
   .log li:first-child { color: var(--text); }
 
   .caveat { color: var(--dim); font-size: 11.5px; line-height: 1.5; margin-top: 18px; border-top: 1px solid var(--line); padding-top: 12px; }
+  .caveat + .caveat { margin-top: 10px; }
 </style>

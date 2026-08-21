@@ -26,8 +26,16 @@
 //! - **Loop freedom.** Distance strictly decreases at every hop and is bounded
 //!   below by zero, so a packet cannot revisit a node.
 //! - **Delivery on a settled tree.** A node's tree neighbour towards the
-//!   destination is always exactly one hop closer, so a node with a consistent
-//!   view always has a next hop to offer.
+//!   destination is always closer by exactly what the link between them costs,
+//!   so a node with a consistent view always has a next hop to offer.
+//!
+//! Every link costs something to cross — latency, in ironwood's case, and
+//! whatever the caller measures here — and both decisions weigh it. A node sits
+//! below the peer offering the cheapest walk to the root rather than the
+//! shortest one, and among the peers that make strict progress it hands a
+//! packet to whichever leaves the least left to pay. A [`Cost`] is never zero,
+//! which is what keeps both of the properties above standing; a network whose
+//! links all cost [`Cost::UNIT`] measures distance in hops.
 //!
 //! The tree itself is loop-free for a separate reason: an announcement carries
 //! its whole path, and a node refuses to sit below any path that already runs
@@ -52,8 +60,8 @@
 //! That is what makes a network of them deterministically simulatable and what
 //! should make the argument above tractable to check in a proof assistant.
 //!
-//! Three things ironwood does are deliberately left out, each of them an
-//! optimisation or a hardening of the model above rather than part of it:
+//! Two things ironwood does are deliberately left out, each of them a
+//! hardening or an optimisation of the model above rather than part of it:
 //!
 //! - **Cryptography.** Ironwood signs announcements so a node cannot lie about
 //!   its parent. Here a key is an opaque identifier and announcements are
@@ -61,30 +69,33 @@
 //! - **Bloom filters.** Ironwood keeps constant state per peer and finds
 //!   unknown destinations by lookup. Here every node learns every announcement,
 //!   which is linear in the size of the network but needs no lookup protocol.
-//! - **Link cost.** Ironwood weighs latency when picking a parent and a next
-//!   hop. Here every link counts the same, so the choice is a pure function of
-//!   the keys involved.
 //!
 //! # Example
 //!
 //! ```
-//! use blackwood::{Message, Node, PublicKey, Timing};
+//! use blackwood::{Cost, Message, Node, PublicKey, Timing};
 //!
 //! let (a, b) = (PublicKey::new([1; 32]), PublicKey::new([2; 32]));
 //! let (mut a_node, mut b_node) = (Node::new(0, a), Node::new(0, b));
 //!
-//! // Bring up the link, then hand each side what the other offered.
-//! let to_b = a_node.add_peer(0, b);
-//! for envelope in b_node.add_peer(0, a) {
+//! // Bring up the link, then hand each side what the other offered. Nothing
+//! // has been measured about it, so it is priced at a single hop.
+//! let to_b = a_node.add_peer(0, b, Cost::UNIT);
+//! for envelope in b_node.add_peer(0, a, Cost::UNIT) {
 //!     a_node.handle(0, b, envelope.message);
 //! }
+//! // Hearing from a moves b below it, and saying so is what tells a where b
+//! // now sits. Until that reply lands, a still believes b is off on its own.
 //! for envelope in to_b {
-//!     b_node.handle(0, a, envelope.message);
+//!     for reply in b_node.handle(0, a, envelope.message) {
+//!         a_node.handle(0, b, reply.message);
+//!     }
 //! }
 //!
-//! // The smaller key is the root, and the other sits below it.
+//! // The smaller key is the root, and the other sits one link below it.
 //! assert_eq!(b_node.root(), a);
 //! assert_eq!(b_node.parent(), Some(a));
+//! assert_eq!(b_node.cost_to_root(), 1);
 //!
 //! // A packet crosses the single hop.
 //! for envelope in a_node.send(b, b"hello".to_vec()).expect("route is known") {
@@ -108,4 +119,4 @@ pub mod tree;
 pub use key::{KEY_LEN, PublicKey};
 pub use message::{Envelope, Message, Packet};
 pub use node::{Node, SendError, Timing};
-pub use tree::{Announcement, MalformedAnnouncement, distance};
+pub use tree::{Announcement, Cost, Hop, MalformedAnnouncement, distance};

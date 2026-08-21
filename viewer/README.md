@@ -28,14 +28,24 @@ Click a node to select it, and a second node for the other end of an action.
 | --- | --- |
 | Add node | Adds an isolated node |
 | Remove node | Removes the first selected node and its links |
+| cost | What a new link costs to cross, and what **Re-price** sets one to |
 | Link / Unlink | Brings a link between the two selected nodes up or down |
+| Re-price | Re-measures the link between them at the cost in the box |
 | Send packet | Sends one packet from the first selection to the second and animates its route |
 | +1s / +5s | Moves the simulated clock forward, letting nodes reissue and expire announcements |
 | Reset | Rebuilds the starting network |
 
-The root is ringed in gold, links to a node's parent are solid, and every other
-link is dashed. After each change the simulator runs gossip to quiescence, so
-what you see is the settled tree.
+The root is ringed in gold, links to a node's parent are solid, every other link
+is dashed, and each carries what it costs to cross. After each change the
+simulator runs gossip to quiescence, so what you see is the settled tree.
+
+The network opens with one link priced at 5 and the rest at 1, so the tree that
+forms is the cheapest one rather than the shallowest: `4` reaches the root the
+long way round, by way of `3`, rather than over its own link to `2`. Select
+`2` and `4`, re-price that link to 1, and the tree snaps back — nothing crossed
+the network to make it happen, since a link's cost is something each end
+measures for itself. The *cost* column is what the walk from a node up to the
+root costs, and the log prices each packet the same way.
 
 The clock only moves when you move it, which makes soft state visible. The
 *knows* column counts the announcements a node is holding: remove a node and

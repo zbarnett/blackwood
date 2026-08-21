@@ -6,9 +6,9 @@
 //! system; the only socket in this crate belongs to the HTTP server that shows
 //! the result.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
-use blackwood::{Envelope, KEY_LEN, Message, Node, PublicKey, Timing};
+use blackwood::{Cost, Envelope, KEY_LEN, Message, Node, PublicKey, Timing};
 
 /// A short label for a node, used as its identity throughout the UI.
 pub type Id = u8;
@@ -35,15 +35,18 @@ pub struct Delivery {
     pub route: Vec<Id>,
     /// Whether it reached the node it was addressed to.
     pub delivered: bool,
+    /// What the links it crossed cost, added up.
+    pub cost: u64,
 }
 
 impl Delivery {
     /// The JSON fields a caller adds to its response, without the braces.
     pub fn json_fields(&self) -> String {
         format!(
-            r#""route":{},"delivered":{}"#,
+            r#""route":{},"delivered":{},"cost":{}"#,
             json_ids(self.route.iter().copied()),
-            self.delivered
+            self.delivered,
+            self.cost
         )
     }
 }
@@ -51,8 +54,10 @@ impl Delivery {
 /// Everything the viewer knows.
 pub struct Sim {
     nodes: BTreeMap<Id, Node>,
-    /// Links, each held once with the smaller label first.
-    links: BTreeSet<(Id, Id)>,
+    /// Links and what each costs to cross, each held once with the smaller
+    /// label first. Both ends of a link agree on its cost here; a node itself
+    /// makes no such assumption, since each end measures for itself.
+    links: BTreeMap<(Id, Id), Cost>,
     queue: VecDeque<InFlight>,
     /// The clock every node shares. Only [`Sim::advance`] moves it, so nothing
     /// expires or is reissued except when the viewer asks for it.
@@ -78,20 +83,22 @@ impl Sim {
     pub fn new() -> Self {
         let mut sim = Self {
             nodes: BTreeMap::new(),
-            links: BTreeSet::new(),
+            links: BTreeMap::new(),
             queue: VecDeque::new(),
             now: 0,
             next_id: 1,
             log: Vec::new(),
             version: 0,
         };
-        // These cannot fail: the labels are fresh and the links are between
-        // distinct nodes that were just created.
+        // These cannot fail: the labels are fresh, the links are between
+        // distinct nodes that were just created, and no cost is zero.
         for _ in 0..5 {
             let _ = sim.add_node();
         }
-        for (a, b) in [(1, 2), (2, 3), (3, 4), (2, 4), (4, 5)] {
-            let _ = sim.add_link(a, b);
+        // The 2-4 link is the short way round and the dear one, so the tree
+        // that forms is the cheapest one rather than the shallowest.
+        for (a, b, cost) in [(1, 2, 1), (2, 3, 1), (3, 4, 1), (2, 4, 5), (4, 5, 1)] {
+            let _ = sim.add_link(a, b, cost);
         }
         sim.log.clear();
         sim.note("network ready");
@@ -124,29 +131,43 @@ impl Sim {
         Ok(())
     }
 
-    /// Brings up a link between two nodes.
-    pub fn add_link(&mut self, a: Id, b: Id) -> Result<(), String> {
+    /// Brings up a link between two nodes, costing `cost` to cross.
+    pub fn add_link(&mut self, a: Id, b: Id, cost: u64) -> Result<(), String> {
         if a == b {
             return Err("a node cannot link to itself".into());
         }
         self.require(a)?;
         self.require(b)?;
-        if !self.links.insert(ordered(a, b)) {
+        let cost = price(cost)?;
+        if self.links.contains_key(&ordered(a, b)) {
             return Err(format!("{a} and {b} are already linked"));
         }
-        let now = self.now;
-        for (near, far) in [(a, b), (b, a)] {
-            let outbound = self.node_mut(near)?.add_peer(now, key_of(far));
-            self.enqueue(near, outbound);
+        self.connect(a, b, cost);
+        self.note(&format!("linked {a} and {b} at cost {cost}"));
+        Ok(())
+    }
+
+    /// Re-prices a link that is already up.
+    ///
+    /// This is what a real caller does when it measures a peering again, and
+    /// it is the whole of what link cost changes: no message crosses the
+    /// network, but every node that was routing over this link reconsiders.
+    pub fn set_link_cost(&mut self, a: Id, b: Id, cost: u64) -> Result<(), String> {
+        let cost = price(cost)?;
+        let Some(&current) = self.links.get(&ordered(a, b)) else {
+            return Err(format!("{a} and {b} are not linked"));
+        };
+        if current == cost {
+            return Err(format!("{a} and {b} already cost {cost}"));
         }
-        self.run();
-        self.note(&format!("linked {a} and {b}"));
+        self.connect(a, b, cost);
+        self.note(&format!("{a} and {b} now cost {cost}, was {current}"));
         Ok(())
     }
 
     /// Tears down a link.
     pub fn remove_link(&mut self, a: Id, b: Id) -> Result<(), String> {
-        if !self.links.contains(&ordered(a, b)) {
+        if !self.links.contains_key(&ordered(a, b)) {
             return Err(format!("{a} and {b} are not linked"));
         }
         self.unlink(a, b);
@@ -218,16 +239,21 @@ impl Sim {
 
         let last = *route.last().unwrap_or(&from);
         let delivered = !self.node_mut(last)?.take_delivered().is_empty();
+        let cost = self.cost_of(&route);
         self.note(&format!(
-            "packet {from} to {to}: {} ({})",
+            "packet {from} to {to}: {} ({delivered_or_not}, cost {cost})",
             route
                 .iter()
                 .map(Id::to_string)
                 .collect::<Vec<_>>()
                 .join(" \u{2192} "),
-            if delivered { "delivered" } else { "dropped" }
+            delivered_or_not = if delivered { "delivered" } else { "dropped" }
         ));
-        Ok(Delivery { route, delivered })
+        Ok(Delivery {
+            route,
+            delivered,
+            cost,
+        })
     }
 
     /// The current state of the whole network, as JSON.
@@ -237,14 +263,15 @@ impl Sim {
             .iter()
             .map(|(id, node)| {
                 format!(
-                    r#"{{"id":{id},"root":{},"parent":{},"path":{},"peers":{},"knows":{}}}"#,
+                    r#"{{"id":{id},"root":{},"parent":{},"path":{},"cost":{},"peers":{},"knows":{}}}"#,
                     id_of(node.root()),
                     match node.parent() {
                         Some(parent) => id_of(parent).to_string(),
                         None => "null".into(),
                     },
-                    json_ids(node.path().iter().map(|key| id_of(*key))),
-                    json_ids(node.peers().map(id_of)),
+                    json_ids(node.path().iter().map(|hop| id_of(hop.key))),
+                    node.cost_to_root(),
+                    json_ids(node.peers().map(|(peer, _)| id_of(peer))),
                     node.known().count(),
                 )
             })
@@ -254,9 +281,9 @@ impl Sim {
         let links = self
             .links
             .iter()
-            .map(|(a, b)| {
+            .map(|((a, b), cost)| {
                 let tree = self.parent_of(*a) == Some(*b) || self.parent_of(*b) == Some(*a);
-                format!(r#"{{"a":{a},"b":{b},"tree":{tree}}}"#)
+                format!(r#"{{"a":{a},"b":{b},"cost":{cost},"tree":{tree}}}"#)
             })
             .collect::<Vec<_>>()
             .join(",");
@@ -300,9 +327,34 @@ impl Sim {
 
     fn peers_of(&self, id: Id) -> Vec<Id> {
         match self.nodes.get(&id) {
-            Some(node) => node.peers().map(id_of).collect(),
+            Some(node) => node.peers().map(|(peer, _)| id_of(peer)).collect(),
             None => Vec::new(),
         }
+    }
+
+    /// What crossing every link along `route` costs.
+    fn cost_of(&self, route: &[Id]) -> u64 {
+        route
+            .windows(2)
+            .filter_map(|pair| self.links.get(&ordered(pair[0], pair[1])))
+            .fold(0, |total, cost| total.saturating_add(cost.get()))
+    }
+
+    /// Prices a link on both sides and lets the network settle.
+    ///
+    /// Each node is told separately what its own end costs, because that is
+    /// all a node ever knows: nothing in the core assumes the two ends of a
+    /// link agree, and it is only this simulator that makes them.
+    fn connect(&mut self, a: Id, b: Id, cost: Cost) {
+        self.links.insert(ordered(a, b), cost);
+        let now = self.now;
+        for (near, far) in [(a, b), (b, a)] {
+            if let Ok(node) = self.node_mut(near) {
+                let outbound = node.add_peer(now, key_of(far), cost);
+                self.enqueue(near, outbound);
+            }
+        }
+        self.run();
     }
 
     /// Drops a link on both sides without logging or running the queue.
@@ -352,6 +404,11 @@ impl Sim {
         self.version += 1;
         self.log.push(line.to_string());
     }
+}
+
+/// Reads a cost off the wire, where a link that costs nothing is not a link.
+fn price(cost: u64) -> Result<Cost, String> {
+    Cost::new(cost).ok_or_else(|| "a link costs at least 1".to_string())
 }
 
 fn ordered(a: Id, b: Id) -> (Id, Id) {

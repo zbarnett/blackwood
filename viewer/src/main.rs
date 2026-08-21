@@ -105,7 +105,19 @@ fn run(command: &str, request: &http::Request, sim: &mut Sim) -> Result<Option<S
             Ok(None)
         }
         "link/add" => {
-            sim.add_link(request.number::<Id>("a")?, request.number::<Id>("b")?)?;
+            sim.add_link(
+                request.number::<Id>("a")?,
+                request.number::<Id>("b")?,
+                request.number::<u64>("cost")?,
+            )?;
+            Ok(None)
+        }
+        "link/cost" => {
+            sim.set_link_cost(
+                request.number::<Id>("a")?,
+                request.number::<Id>("b")?,
+                request.number::<u64>("cost")?,
+            )?;
             Ok(None)
         }
         "link/remove" => {
