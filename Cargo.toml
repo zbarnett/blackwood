@@ -6,4 +6,4 @@ edition = "2024"
 [dependencies]
 
 [workspace]
-members = ["viewer"]
+members = ["viewer", "viewer/wasm"]

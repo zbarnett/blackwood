@@ -1,6 +1,8 @@
 <script>
   import Graph from './Graph.svelte';
+  import { connect } from './transport.js';
 
+  let transport = $state(null);
   let state = $state(null);
   let error = $state(null);
   let selected = $state([]);
@@ -12,12 +14,11 @@
   const nodes = $derived(state?.nodes ?? []);
   const links = $derived(state?.links ?? []);
 
-  async function call(command, params = {}, method = 'POST') {
-    const query = new URLSearchParams(params).toString();
+  async function call(command, params = {}) {
+    if (!transport) return null;
     busy = true;
     try {
-      const response = await fetch(`/api/${command}${query ? `?${query}` : ''}`, { method });
-      const body = await response.json();
+      const body = await transport.call(command, params);
       state = body.state;
       error = body.ok ? null : body.error;
       return body;
@@ -44,27 +45,36 @@
     selected = selected.filter((held) => held !== from);
   }
 
-  // The network can also change from elsewhere, so keep polling for a new version.
+  // A served network can also change from elsewhere, so keep asking it for a
+  // new version. A network running in this page can only change from here.
   $effect(() => {
+    if (!transport?.live) return;
     const timer = setInterval(async () => {
       if (busy) return;
-      try {
-        const response = await fetch('/api/state');
-        const body = await response.json();
-        if (body.state.version !== state?.version) state = body.state;
-      } catch {
-        // The server went away; the next tick will find out.
-      }
+      const body = await transport.call('state').catch(() => null);
+      if (body && body.state.version !== state?.version) state = body.state;
     }, 700);
     return () => clearInterval(timer);
   });
 
-  call('state', {}, 'GET');
+  connect().then(async (connected) => {
+    transport = connected;
+    await call('state');
+  }, (failure) => {
+    error = `could not reach a simulator: ${failure}`;
+  });
 </script>
 
 <header>
   <h1>blackwood</h1>
   <span class="dim">a simulated network, routed by tree embedding</span>
+  {#if transport}
+    <span class="badge" title={transport.kind === 'wasm'
+      ? 'the Rust simulator is compiled to WebAssembly and running in this page'
+      : 'the Rust simulator is running behind a local server'}>
+      {transport.kind === 'wasm' ? 'wasm' : 'local server'}
+    </span>
+  {/if}
 </header>
 
 <main>
@@ -165,6 +175,16 @@
   h1 { margin: 0; font-size: 17px; letter-spacing: 0.02em; }
   h2 { margin: 18px 0 7px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--dim); }
   .dim { color: var(--dim); font-size: 13px; }
+
+  .badge {
+    margin-left: auto;
+    padding: 2px 9px;
+    border: 1px solid var(--line);
+    border-radius: 20px;
+    color: var(--dim);
+    font-family: ui-monospace, Menlo, monospace;
+    font-size: 11px;
+  }
 
   main {
     display: grid;

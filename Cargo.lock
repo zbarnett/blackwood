@@ -12,3 +12,10 @@ version = "0.1.0"
 dependencies = [
  "blackwood",
 ]
+
+[[package]]
+name = "blackwood-wasm"
+version = "0.1.0"
+dependencies = [
+ "blackwood-viewer",
+]

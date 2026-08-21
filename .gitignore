@@ -28,3 +28,4 @@ target
 # Viewer UI build output and packages
 viewer/ui/node_modules
 viewer/ui/dist
+viewer/ui/public

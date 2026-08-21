@@ -6,7 +6,9 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "build:wasm": "cargo build --release --locked -p blackwood-wasm --target wasm32-unknown-unknown --manifest-path ../../Cargo.toml && mkdir -p public && cp ../../target/wasm32-unknown-unknown/release/blackwood_wasm.wasm public/blackwood.wasm",
+    "build:static": "npm run build:wasm && npm run build"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.1.1",

@@ -1,0 +1,64 @@
+name: Demo
+
+# Builds the viewer as a static page and publishes it to GitHub Pages. The
+# simulator is compiled to WebAssembly, so the hosted demo runs the same Rust
+# the tests do, with nothing behind it.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Build the simulator as WebAssembly
+        run: |
+          cargo build --release --locked -p blackwood-wasm --target wasm32-unknown-unknown
+          mkdir -p viewer/ui/public
+          cp target/wasm32-unknown-unknown/release/blackwood_wasm.wasm viewer/ui/public/blackwood.wasm
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: viewer/ui/package-lock.json
+
+      - name: Build the UI
+        working-directory: viewer/ui
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: viewer/ui/dist
+
+  # Pull requests build the demo but do not publish it.
+  deploy:
+    if: github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

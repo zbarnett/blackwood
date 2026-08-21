@@ -4,18 +4,20 @@
 //! as Rust values, exactly as they do in the core's tests. The only real socket
 //! is the one this server listens on so a browser can draw the result.
 //!
+//! The same simulator also compiles to WebAssembly, which is how the hosted
+//! demo runs without any server at all.
+//!
 //! ```text
 //! cargo run -p blackwood-viewer -- [port] [ui-directory]
 //! ```
 
 mod http;
-mod sim;
 
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Mutex;
 
-use sim::{Id, Sim};
+use blackwood_viewer::sim::{Id, Sim};
 
 fn main() {
     let mut args = std::env::args().skip(1);
@@ -72,7 +74,7 @@ fn serve(stream: TcpStream, sim: &Mutex<Sim>, ui_root: &std::path::Path) {
                 let state = sim.snapshot();
                 let body = format!(
                     r#"{{"ok":false,"error":{},"state":{state}}}"#,
-                    json_string(&message)
+                    blackwood_viewer::sim::json_string(&message)
                 );
                 http::respond_json(stream, "200 OK", &body);
             }
@@ -112,16 +114,7 @@ fn run(command: &str, request: &http::Request, sim: &mut Sim) -> Result<Option<S
         }
         "send" => {
             let delivery = sim.send(request.number::<Id>("from")?, request.number::<Id>("to")?)?;
-            let route = delivery
-                .route
-                .iter()
-                .map(Id::to_string)
-                .collect::<Vec<_>>()
-                .join(",");
-            Ok(Some(format!(
-                r#""route":[{route}],"delivered":{}"#,
-                delivery.delivered
-            )))
+            Ok(Some(delivery.json_fields()))
         }
         "reset" => {
             *sim = Sim::new();
@@ -129,9 +122,4 @@ fn run(command: &str, request: &http::Request, sim: &mut Sim) -> Result<Option<S
         }
         _ => Err(format!("unknown command {command}")),
     }
-}
-
-fn json_string(value: &str) -> String {
-    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
-    format!("\"{escaped}\"")
 }

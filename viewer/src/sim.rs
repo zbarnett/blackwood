@@ -36,6 +36,17 @@ pub struct Delivery {
     pub delivered: bool,
 }
 
+impl Delivery {
+    /// The JSON fields a caller adds to its response, without the braces.
+    pub fn json_fields(&self) -> String {
+        format!(
+            r#""route":{},"delivered":{}"#,
+            json_ids(self.route.iter().copied()),
+            self.delivered
+        )
+    }
+}
+
 /// Everything the viewer knows.
 pub struct Sim {
     nodes: BTreeMap<Id, Node>,
@@ -300,7 +311,7 @@ fn json_ids(ids: impl Iterator<Item = Id>) -> String {
 }
 
 /// Quotes a string for JSON. Log lines are our own text, but escaping is cheap.
-fn json_string(value: &str) -> String {
+pub fn json_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
     for character in value.chars() {
