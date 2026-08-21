@@ -11,11 +11,19 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: 0
 
 jobs:
   test:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
+
+      # Looks like dead weight (~8s to install a toolchain the image already
+      # has), but it is the opposite: the runner's preinstalled toolchain is
+      # cold on disk, and faulting its ~650MB sysroot into page cache during
+      # compilation costs 20-30s. rustup's download leaves it warm, so
+      # `cargo test` runs in ~0.2s instead. Measured: 12-15s job with this
+      # step, 22-34s without it.
+      - uses: dtolnay/rust-toolchain@stable
+
       - run: cargo test --locked
