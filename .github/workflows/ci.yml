@@ -26,4 +26,5 @@ jobs:
       # step, 22-34s without it.
       - uses: dtolnay/rust-toolchain@stable
 
-      - run: cargo test --locked
+      # --workspace so the viewer compiles here too; only the core has tests.
+      - run: cargo test --locked --workspace

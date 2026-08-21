@@ -1,0 +1,8 @@
+[package]
+name = "blackwood-viewer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# The routing core itself. Nothing here is a third-party dependency.
+blackwood = { path = ".." }

@@ -24,3 +24,7 @@ target
 # Added by cargo
 
 /target
+
+# Viewer UI build output and packages
+viewer/ui/node_modules
+viewer/ui/dist
