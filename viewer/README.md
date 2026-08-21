@@ -30,17 +30,24 @@ Click a node to select it, and a second node for the other end of an action.
 | Remove node | Removes the first selected node and its links |
 | Link / Unlink | Brings a link between the two selected nodes up or down |
 | Send packet | Sends one packet from the first selection to the second and animates its route |
+| +1s / +5s | Moves the simulated clock forward, letting nodes reissue and expire announcements |
 | Reset | Rebuilds the starting network |
 
 The root is ringed in gold, links to a node's parent are solid, and every other
 link is dashed. After each change the simulator runs gossip to quiescence, so
 what you see is the settled tree.
 
+The clock only moves when you move it, which makes soft state visible. The
+*knows* column counts the announcements a node is holding: remove a node and
+that count stays put — its neighbours re-parent at once, but the rest of the
+network goes on remembering where it sat — then press **+5s** and watch the
+counts drop as the stale announcements expire.
+
 ## Shape of it
 
 | File | Role |
 | --- | --- |
-| `src/sim.rs` | Holds the nodes and the queue of messages in flight |
+| `src/sim.rs` | Holds the nodes, the queue of messages in flight, and the clock |
 | `src/http.rs` | Enough HTTP to talk to a browser |
 | `src/main.rs` | Maps requests onto simulator commands |
 | `ui/` | Svelte app: the graph, the controls, and the node table |

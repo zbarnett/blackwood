@@ -1,13 +1,14 @@
 //! A simulated network of [`Node`]s, driven by the viewer.
 //!
 //! This is the same shape as the simulator in the core's integration tests: a
-//! queue of messages in flight and a map of nodes to hand them to. Nothing here
-//! reaches the operating system; the only socket in this crate belongs to the
-//! HTTP server that shows the result.
+//! queue of messages in flight, a map of nodes to hand them to, and a clock
+//! that moves only when somebody asks it to. Nothing here reaches the operating
+//! system; the only socket in this crate belongs to the HTTP server that shows
+//! the result.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use blackwood::{Envelope, KEY_LEN, Message, Node, PublicKey};
+use blackwood::{Envelope, KEY_LEN, Message, Node, PublicKey, Timing};
 
 /// A short label for a node, used as its identity throughout the UI.
 pub type Id = u8;
@@ -53,13 +54,22 @@ pub struct Sim {
     /// Links, each held once with the smaller label first.
     links: BTreeSet<(Id, Id)>,
     queue: VecDeque<InFlight>,
-    /// Labels are never reused. A node added under an old label would restart
-    /// its sequence numbers at zero, and its peers, which have no clock to
-    /// expire the old announcement with, would dismiss it as stale.
+    /// The clock every node shares. Only [`Sim::advance`] moves it, so nothing
+    /// expires or is reissued except when the viewer asks for it.
+    now: u64,
+    /// Labels are never reused. Reusing one is only safe once the network has
+    /// forgotten the node that held it, and the viewer cannot promise that at
+    /// the moment somebody presses the button.
     next_id: Id,
     log: Vec<String>,
     /// Bumped on every change, so the UI can tell whether it needs to redraw.
     version: u64,
+}
+
+impl Default for Sim {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Sim {
@@ -70,6 +80,7 @@ impl Sim {
             nodes: BTreeMap::new(),
             links: BTreeSet::new(),
             queue: VecDeque::new(),
+            now: 0,
             next_id: 1,
             log: Vec::new(),
             version: 0,
@@ -94,7 +105,7 @@ impl Sim {
             return Err("out of labels".into());
         }
         self.next_id += 1;
-        self.nodes.insert(id, Node::new(key_of(id)));
+        self.nodes.insert(id, Node::new(self.now, key_of(id)));
         self.note(&format!("added node {id}"));
         Ok(id)
     }
@@ -123,8 +134,9 @@ impl Sim {
         if !self.links.insert(ordered(a, b)) {
             return Err(format!("{a} and {b} are already linked"));
         }
+        let now = self.now;
         for (near, far) in [(a, b), (b, a)] {
-            let outbound = self.node_mut(near)?.add_peer(key_of(far));
+            let outbound = self.node_mut(near)?.add_peer(now, key_of(far));
             self.enqueue(near, outbound);
         }
         self.run();
@@ -143,6 +155,37 @@ impl Sim {
         Ok(())
     }
 
+    /// Moves the clock forward, letting nodes reissue and expire announcements.
+    ///
+    /// Time is stepped in refresh-sized increments rather than jumped in one
+    /// go, because a jump would look to every node as though the whole network
+    /// had fallen silent for the entire interval.
+    pub fn advance(&mut self, by: u64) {
+        let step = Timing::DEFAULT.refresh.max(1);
+        let before = self.total_known();
+        let target = self.now.saturating_add(by);
+        while self.now < target {
+            self.now = self.now.saturating_add(step).min(target);
+            let now = self.now;
+            for id in self.nodes.keys().copied().collect::<Vec<_>>() {
+                if let Ok(node) = self.node_mut(id) {
+                    let outbound = node.tick(now);
+                    self.enqueue(id, outbound);
+                }
+            }
+            self.run();
+        }
+        let forgotten = before.saturating_sub(self.total_known());
+        let seconds = self.now as f64 / 1000.0;
+        match forgotten {
+            0 => self.note(&format!("clock at {seconds:.1}s")),
+            1 => self.note(&format!("clock at {seconds:.1}s, 1 announcement expired")),
+            n => self.note(&format!(
+                "clock at {seconds:.1}s, {n} announcements expired"
+            )),
+        }
+    }
+
     /// Sends one packet and traces the path it took.
     pub fn send(&mut self, from: Id, to: Id) -> Result<Delivery, String> {
         self.require(from)?;
@@ -156,6 +199,7 @@ impl Sim {
         // Forwarding a packet yields at most one packet, so following it is a
         // walk rather than a search. The sender of each hop is whichever node
         // is holding the packet, which is what the receiver checks it against.
+        let now = self.now;
         let mut route = vec![from];
         let mut carrier = from;
         let mut hop = outbound.into_iter().next();
@@ -167,7 +211,7 @@ impl Sim {
             route.push(next);
             let produced = self
                 .node_mut(next)?
-                .handle(key_of(carrier), envelope.message);
+                .handle(now, key_of(carrier), envelope.message);
             carrier = next;
             hop = produced.into_iter().next();
         }
@@ -193,7 +237,7 @@ impl Sim {
             .iter()
             .map(|(id, node)| {
                 format!(
-                    r#"{{"id":{id},"root":{},"parent":{},"path":{},"peers":{}}}"#,
+                    r#"{{"id":{id},"root":{},"parent":{},"path":{},"peers":{},"knows":{}}}"#,
                     id_of(node.root()),
                     match node.parent() {
                         Some(parent) => id_of(parent).to_string(),
@@ -201,6 +245,7 @@ impl Sim {
                     },
                     json_ids(node.path().iter().map(|key| id_of(*key))),
                     json_ids(node.peers().map(id_of)),
+                    node.known().count(),
                 )
             })
             .collect::<Vec<_>>()
@@ -226,9 +271,15 @@ impl Sim {
             .join(",");
 
         format!(
-            r#"{{"version":{},"nodes":[{nodes}],"links":[{links}],"log":[{log}]}}"#,
-            self.version
+            r#"{{"version":{},"now":{},"nodes":[{nodes}],"links":[{links}],"log":[{log}]}}"#,
+            self.version, self.now
         )
+    }
+
+    /// How many announcements the network holds in total, which is what
+    /// expiry shrinks.
+    fn total_known(&self) -> usize {
+        self.nodes.values().map(|node| node.known().count()).sum()
     }
 
     fn require(&self, id: Id) -> Result<(), String> {
@@ -257,9 +308,10 @@ impl Sim {
     /// Drops a link on both sides without logging or running the queue.
     fn unlink(&mut self, a: Id, b: Id) {
         self.links.remove(&ordered(a, b));
+        let now = self.now;
         for (near, far) in [(a, b), (b, a)] {
             if let Ok(node) = self.node_mut(near) {
-                let outbound = node.remove_peer(key_of(far));
+                let outbound = node.remove_peer(now, key_of(far));
                 self.enqueue(near, outbound);
             }
         }
@@ -287,10 +339,11 @@ impl Sim {
             let Some(in_flight) = self.queue.pop_front() else {
                 return;
             };
+            let now = self.now;
             let Ok(node) = self.node_mut(id_of(in_flight.to)) else {
                 continue;
             };
-            let outbound = node.handle(in_flight.from, in_flight.message);
+            let outbound = node.handle(now, in_flight.from, in_flight.message);
             self.enqueue(id_of(in_flight.to), outbound);
         }
     }

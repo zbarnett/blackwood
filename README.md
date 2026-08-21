@@ -9,7 +9,8 @@ Routing works by embedding the network in a spanning tree and greedily
 forwarding towards the destination in the metric that embedding induces.
 
 **[Try the demo →](https://zbarnett.github.io/blackwood/)** — a whole network in
-one page: add and remove nodes and links, and watch a packet find its way.
+one page: add and remove nodes and links, move the clock forward, and watch a
+packet find its way.
 
 [![The viewer showing a five-node network](docs/viewer.png)](https://zbarnett.github.io/blackwood/)
 
@@ -34,14 +35,23 @@ to the destination. Three properties follow, each from a local rule:
 - **Delivery on a settled tree.** A node's tree neighbour towards the
   destination is always exactly one hop closer, so there is always a next hop.
 
+Announcements are soft state. A node reissues its own on a schedule and forgets
+any it has not heard reissued, so a view repairs itself rather than only
+accumulating: a node that vanishes is eventually forgotten instead of lingering
+as a route to nowhere, and one that comes back with its sequence numbers reset
+is not mistaken for a stale copy of itself.
+
 Nothing in the core performs I/O, reads a clock, allocates a thread, or calls
 into the operating system. It has no dependencies beyond `std`, no `unsafe`, and
 no panics: a node is a state machine whose every effect is the messages it hands
-back. That is what makes a network of them deterministically simulatable, and
-what should make the argument above tractable to check in a proof assistant.
+back and whose every input — a message, a link coming or going, the passage of
+time — is an argument to a method. Even expiry reads no clock; `Node::tick` is
+handed the current instant by its caller, in whatever unit that caller counts
+in. That is what makes a network of them deterministically simulatable, and what
+should make the argument above tractable to check in a proof assistant.
 
-Cryptography, soft-state expiry, bloom-filter lookups and link costs are all
-deliberately absent; [`src/lib.rs`](src/lib.rs) records what each one would add.
+Cryptography, bloom-filter lookups and link costs are deliberately absent;
+[`src/lib.rs`](src/lib.rs) records what each one would add.
 
 ## Layout
 

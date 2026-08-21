@@ -1,12 +1,13 @@
 //! A deterministic simulation of a small network.
 //!
 //! The simulator is the whole of the "network" here: a queue of messages in
-//! flight and a map of nodes to hand them to. Links never reorder or drop, and
-//! nothing runs concurrently, so a run is reproducible down to the hop.
+//! flight, a map of nodes to hand them to, and a clock that only moves when the
+//! test moves it. Links never reorder or drop, and nothing runs concurrently,
+//! so a run is reproducible down to the hop.
 
 use std::collections::{BTreeMap, VecDeque};
 
-use blackwood::{KEY_LEN, Message, Node, Packet, PublicKey};
+use blackwood::{KEY_LEN, Message, Node, Packet, PublicKey, SendError, Timing};
 
 fn key(n: u8) -> PublicKey {
     PublicKey::new([n; KEY_LEN])
@@ -24,14 +25,17 @@ struct Network {
     queue: VecDeque<InFlight>,
     /// How many times a packet has been handed to a node, i.e. hops taken.
     hops: usize,
+    /// The clock every node shares. Only [`Network::advance`] moves it.
+    now: u64,
 }
 
 impl Network {
     fn new(keys: impl IntoIterator<Item = PublicKey>) -> Self {
         Self {
-            nodes: keys.into_iter().map(|k| (k, Node::new(k))).collect(),
+            nodes: keys.into_iter().map(|k| (k, Node::new(0, k))).collect(),
             queue: VecDeque::new(),
             hops: 0,
+            now: 0,
         }
     }
 
@@ -45,9 +49,38 @@ impl Network {
 
     /// Brings up a bidirectional link between two nodes.
     fn link(&mut self, a: PublicKey, b: PublicKey) {
+        let now = self.now;
         for (near, far) in [(a, b), (b, a)] {
-            let outbound = self.node_mut(near).add_peer(far);
+            let outbound = self.node_mut(near).add_peer(now, far);
             self.enqueue(near, outbound);
+        }
+    }
+
+    /// Takes a bidirectional link back down.
+    fn unlink(&mut self, a: PublicKey, b: PublicKey) {
+        let now = self.now;
+        for (near, far) in [(a, b), (b, a)] {
+            let outbound = self.node_mut(near).remove_peer(now, far);
+            self.enqueue(near, outbound);
+        }
+    }
+
+    /// Moves the clock forward by `by`, letting every node reissue and expire.
+    ///
+    /// Time is stepped in refresh-sized increments rather than jumped in one
+    /// go, because a jump would look to every node as though the whole network
+    /// had fallen silent for the entire interval.
+    fn advance(&mut self, by: u64) {
+        let step = Timing::DEFAULT.refresh;
+        let target = self.now + by;
+        while self.now < target {
+            self.now = (self.now + step).min(target);
+            let now = self.now;
+            for key in self.nodes.keys().copied().collect::<Vec<_>>() {
+                let outbound = self.node_mut(key).tick(now);
+                self.enqueue(key, outbound);
+            }
+            self.run();
         }
     }
 
@@ -76,11 +109,22 @@ impl Network {
             if matches!(in_flight.message, Message::Packet(_)) {
                 self.hops += 1;
             }
-            let outbound = self
-                .node_mut(in_flight.to)
-                .handle(in_flight.from, in_flight.message);
+            let now = self.now;
+            let outbound =
+                self.node_mut(in_flight.to)
+                    .handle(now, in_flight.from, in_flight.message);
             self.enqueue(in_flight.to, outbound);
         }
+    }
+
+    /// Where every node believes it sits, for comparing one moment to another.
+    fn positions(&self, keys: &[PublicKey]) -> Vec<(PublicKey, Option<PublicKey>, Vec<PublicKey>)> {
+        keys.iter()
+            .map(|&key| {
+                let node = self.node(key);
+                (node.root(), node.parent(), node.path().to_vec())
+            })
+            .collect()
     }
 }
 
@@ -217,4 +261,102 @@ fn a_link_coming_up_late_is_absorbed() {
     }
     assert_eq!(net.node(b).parent(), Some(a));
     assert_eq!(net.node(c).parent(), Some(b));
+}
+
+#[test]
+fn a_settled_network_is_undisturbed_by_the_passage_of_time() {
+    let (mut net, keys) = ring_with_a_tail();
+    net.run();
+    let before = net.positions(&keys);
+
+    // Long enough that every announcement would have expired many times over
+    // had it not been reissued.
+    net.advance(Timing::DEFAULT.expiry * 10);
+
+    assert_eq!(
+        net.positions(&keys),
+        before,
+        "reissues left every node exactly where it was"
+    );
+    for node in keys {
+        assert_eq!(
+            net.node(node).known().count(),
+            keys.len() - 1,
+            "everyone still knows where everyone else is"
+        );
+    }
+}
+
+#[test]
+fn a_stranded_node_is_eventually_forgotten() {
+    let (mut net, [a, b, c, d, e]) = ring_with_a_tail();
+    net.run();
+
+    // e hangs off d alone, so taking that link down strands it.
+    net.unlink(d, e);
+    net.run();
+
+    // Its neighbours reparent at once, but nothing has yet told them e is gone,
+    // so they still believe they hold a route to it.
+    assert!(net.node(d).known().any(|known| known == e));
+    assert!(
+        net.node_mut(a).send(e, b"still there?".to_vec()).is_ok(),
+        "a would send a packet into the dead end"
+    );
+
+    net.advance(Timing::DEFAULT.expiry);
+
+    for node in [a, b, c, d] {
+        assert!(
+            !net.node(node).known().any(|known| known == e),
+            "{node:?} still remembers e"
+        );
+    }
+    assert_eq!(
+        net.node_mut(a).send(e, b"gone".to_vec()),
+        Err(SendError::NoRoute),
+        "the route to nowhere is gone rather than silently dropping packets"
+    );
+    assert_eq!(net.node(e).root(), e, "and e is now a network of one");
+}
+
+#[test]
+fn a_node_that_starts_over_rejoins_the_tree() {
+    let (mut net, [a, _b, _c, d, e]) = ring_with_a_tail();
+    net.run();
+
+    // e leaves and, over the course of the outage, is forgotten. Meanwhile the
+    // e that is still running climbs to a much higher sequence number.
+    net.unlink(d, e);
+    net.advance(Timing::DEFAULT.expiry * 4);
+    assert!(!net.node(d).known().any(|known| known == e));
+
+    // It comes back as a fresh process would: same key, sequence numbers back
+    // at zero. Without expiry that announcement would look like ancient news
+    // and every node would go on routing towards where e used to be.
+    net.nodes.insert(e, Node::new(net.now, e));
+    net.link(d, e);
+    net.run();
+
+    assert_eq!(
+        net.node(e).root(),
+        a,
+        "the returning node is back on the tree"
+    );
+    assert_eq!(net.node(e).parent(), Some(d));
+
+    let outbound = net
+        .node_mut(a)
+        .send(e, b"welcome back".to_vec())
+        .expect("the route is known again");
+    net.enqueue(a, outbound);
+    net.run();
+    assert_eq!(
+        net.node_mut(e).take_delivered(),
+        vec![Packet {
+            src: a,
+            dst: e,
+            payload: b"welcome back".to_vec(),
+        }]
+    );
 }

@@ -68,6 +68,15 @@ pub extern "C" fn link_remove(a: u32, b: u32) {
     }));
 }
 
+/// Moves the clock forward by `by`, in the same unit the core counts in.
+#[unsafe(no_mangle)]
+pub extern "C" fn advance(by: u32) {
+    respond(with_sim(|sim| {
+        sim.advance(u64::from(by));
+        Ok(None)
+    }));
+}
+
 /// Sends one packet, reporting the route it took.
 #[unsafe(no_mangle)]
 pub extern "C" fn send(from: u32, to: u32) {

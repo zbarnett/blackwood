@@ -112,6 +112,10 @@ fn run(command: &str, request: &http::Request, sim: &mut Sim) -> Result<Option<S
             sim.remove_link(request.number::<Id>("a")?, request.number::<Id>("b")?)?;
             Ok(None)
         }
+        "advance" => {
+            sim.advance(request.number::<u64>("by")?);
+            Ok(None)
+        }
         "send" => {
             let delivery = sim.send(request.number::<Id>("from")?, request.number::<Id>("to")?)?;
             Ok(Some(delivery.json_fields()))

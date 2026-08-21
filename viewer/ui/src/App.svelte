@@ -13,6 +13,7 @@
   const to = $derived(selected[1]);
   const nodes = $derived(state?.nodes ?? []);
   const links = $derived(state?.links ?? []);
+  const clock = $derived(((state?.now ?? 0) / 1000).toFixed(1));
 
   async function call(command, params = {}) {
     if (!transport) return null;
@@ -68,13 +69,18 @@
 <header>
   <h1>blackwood</h1>
   <span class="dim">a simulated network, routed by tree embedding</span>
-  {#if transport}
-    <span class="badge" title={transport.kind === 'wasm'
-      ? 'the Rust simulator is compiled to WebAssembly and running in this page'
-      : 'the Rust simulator is running behind a local server'}>
-      {transport.kind === 'wasm' ? 'wasm' : 'local server'}
+  <span class="badges">
+    {#if transport}
+      <span class="badge" title={transport.kind === 'wasm'
+        ? 'the Rust simulator is compiled to WebAssembly and running in this page'
+        : 'the Rust simulator is running behind a local server'}>
+        {transport.kind === 'wasm' ? 'wasm' : 'local server'}
+      </span>
+    {/if}
+    <span class="badge clock" title="the simulated clock — nothing expires or is reissued until you move it">
+      t {clock}s
     </span>
-  {/if}
+  </span>
 </header>
 
 <main>
@@ -94,6 +100,13 @@
       <span class="divider"></span>
       <button class="primary" disabled={to === undefined} onclick={send}>
         Send packet
+      </button>
+      <span class="divider"></span>
+      <button title="let one second of simulated time pass" onclick={() => call('advance', { by: 1000 })}>
+        +1s
+      </button>
+      <button title="long enough for anything unreissued to expire" onclick={() => call('advance', { by: 5000 })}>
+        +5s
       </button>
       <span class="divider"></span>
       <button onclick={() => { selected = []; flight = null; call('reset'); }}>Reset</button>
@@ -125,7 +138,7 @@
     <h2>Nodes</h2>
     <table>
       <thead>
-        <tr><th>id</th><th>root</th><th>parent</th><th>path</th><th>peers</th></tr>
+        <tr><th>id</th><th>root</th><th>parent</th><th>path</th><th>peers</th><th title="other nodes it holds an announcement for">knows</th></tr>
       </thead>
       <tbody>
         {#each nodes as node (node.id)}
@@ -135,6 +148,7 @@
             <td>{node.parent ?? '—'}</td>
             <td class="mono">{node.path.join('·')}</td>
             <td class="mono">{node.peers.join(' ') || '—'}</td>
+            <td class="mono">{node.knows}</td>
           </tr>
         {/each}
       </tbody>
@@ -157,9 +171,11 @@
     </ol>
 
     <p class="caveat">
-      The core keeps no timers, so what a node learned through a lost peer is
-      not expired. After removing a node, its neighbours re-parent immediately
-      but still remember where it used to sit.
+      Announcements are soft state: a node reissues its own every second and
+      forgets any it has not heard again within three. Nothing here moves the
+      clock but you. Remove a node and its neighbours re-parent at once, but the
+      rest of the network goes on remembering where it sat — press
+      <code>+5s</code> to watch that memory expire.
     </p>
   </aside>
 </main>
@@ -176,8 +192,9 @@
   h2 { margin: 18px 0 7px; font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--dim); }
   .dim { color: var(--dim); font-size: 13px; }
 
+  .badges { margin-left: auto; display: flex; gap: 10px; }
+
   .badge {
-    margin-left: auto;
     padding: 2px 9px;
     border: 1px solid var(--line);
     border-radius: 20px;
@@ -185,6 +202,8 @@
     font-family: ui-monospace, Menlo, monospace;
     font-size: 11px;
   }
+
+  .badge.clock { min-width: 58px; text-align: center; }
 
   main {
     display: grid;

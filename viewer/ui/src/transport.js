@@ -45,6 +45,7 @@ async function overWasm() {
     'node/remove': (p) => exports.node_remove(Number(p.id)),
     'link/add': (p) => exports.link_add(Number(p.a), Number(p.b)),
     'link/remove': (p) => exports.link_remove(Number(p.a), Number(p.b)),
+    advance: (p) => exports.advance(Number(p.by)),
     send: (p) => exports.send(Number(p.from), Number(p.to)),
     reset: () => exports.reset(),
   };
