@@ -4,5 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# The routing core itself. Nothing here is a third-party dependency.
+# The routing core, and the ed25519 that gets injected into it. The viewer
+# runs the real thing: every announcement it draws was signed and checked.
 blackwood = { path = ".." }
+blackwood-ed25519 = { path = "../ed25519" }

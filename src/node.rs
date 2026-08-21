@@ -6,6 +6,7 @@ use std::fmt;
 
 use crate::key::PublicKey;
 use crate::message::{Envelope, Found, Lookup, Message, Packet, Traffic};
+use crate::signature::Signer;
 use crate::summary::Summary;
 use crate::tree::{Announcement, Cost, Hop, distance};
 
@@ -111,8 +112,15 @@ struct Peer {
 /// What it holds is a fixed amount per link, its own position, and the
 /// positions of the nodes it is currently talking to. Nothing here grows with
 /// the size of the network.
+///
+/// The `S` is the cryptography it speaks with: a node signs everything it says
+/// about itself and checks everything it is told about anybody else, but this
+/// crate supplies no algorithm of its own. See [`Signer`].
 #[derive(Clone, Debug)]
-pub struct Node {
+pub struct Node<S> {
+    /// What this node signs as. Its public half is `key`, kept beside it
+    /// because routing asks for it constantly and asks the signer once.
+    signer: S,
     key: PublicKey,
     timing: Timing,
     /// This node's own announcement. It is the sole author of this value.
@@ -127,19 +135,25 @@ pub struct Node {
     delivered: Vec<Packet>,
 }
 
-impl Node {
+impl<S: Signer> Node<S> {
     /// Creates an isolated node, which necessarily believes it is its own root.
-    pub fn new(now: u64, key: PublicKey) -> Self {
-        Self::with_timing(now, key, Timing::DEFAULT)
+    ///
+    /// Its address is whatever key `signer` speaks for, so an identity and the
+    /// means of proving it arrive together and cannot come apart.
+    pub fn new(now: u64, signer: S) -> Self {
+        Self::with_timing(now, signer, Timing::DEFAULT)
     }
 
     /// Creates an isolated node that keeps and reissues state on its own
     /// schedule rather than [`Timing::DEFAULT`].
-    pub fn with_timing(now: u64, key: PublicKey, timing: Timing) -> Self {
+    pub fn with_timing(now: u64, signer: S, timing: Timing) -> Self {
+        let key = signer.public_key();
+        let announcement = Announcement::root_of(&signer, 0);
         Self {
+            signer,
             key,
             timing,
-            announcement: Announcement::root_of(key, 0),
+            announcement,
             announced_at: now,
             peers: BTreeMap::new(),
             infos: BTreeMap::new(),
@@ -219,8 +233,13 @@ impl Node {
             .retain(|_, info| now.saturating_sub(info.heard_at) < expiry);
         self.settle(now, &mut out);
         if now.saturating_sub(self.announced_at) >= self.timing.refresh {
-            let unchanged = self.announcement.clone();
-            self.announce(now, unchanged, &mut out);
+            // The same walk over again, freshly stamped and signed. What stops
+            // a peer forgetting this node is that the number climbed, not that
+            // anything moved. The signer is this node's own, so the restamp
+            // cannot be refused.
+            if let Some(reissued) = self.announcement.with_seq(&self.signer, self.next_seq()) {
+                self.announce(now, reissued, &mut out);
+            }
         }
         out
     }
@@ -379,6 +398,14 @@ impl Node {
         {
             return false;
         }
+        // Everything that enters here came off a link, so this is where a
+        // forgery stops: each hop has to be signed by the node it names, which
+        // no amount of relaying can arrange for a node that never sat there.
+        // Cheaper questions are asked first, but nothing is kept or acted on
+        // until this one is answered.
+        if !announcement.verify::<S>() {
+            return false;
+        }
         self.infos.insert(
             author,
             Info {
@@ -493,23 +520,30 @@ impl Node {
         self.resummarise(out);
     }
 
+    /// The sequence number to stamp the next announcement with.
+    ///
+    /// Saturating rather than wrapping: sequence numbers only mean anything
+    /// while they increase, and reissues make them climb with the clock rather
+    /// than only with topology. The ceiling is unreachable, but a node stuck at
+    /// it going quiet beats one that starts over at zero.
+    fn next_seq(&self) -> u64 {
+        self.announcement.seq().saturating_add(1)
+    }
+
     /// Reconsiders which peer to sit below, announcing the move if it changed.
     fn reparent(&mut self, now: u64, out: &mut Vec<Envelope>) {
-        let best = self.best_position();
-        if best.path() != self.announcement.path() {
+        let best = self.best_position(self.next_seq());
+        // Only a different walk counts as moving. Comparing the announcements
+        // whole would count every restamp above as a move, and the network
+        // would spend itself telling itself that nothing had happened.
+        if !best.same_position(&self.announcement) {
             self.announce(now, best, out);
         }
     }
 
-    /// Takes up `position`, stamps it with a fresh sequence number, and tells
-    /// every peer.
+    /// Takes up `position` and tells every peer.
     fn announce(&mut self, now: u64, position: Announcement, out: &mut Vec<Envelope>) {
-        // Saturating rather than wrapping: sequence numbers only mean anything
-        // while they increase, and reissues make them climb with the clock
-        // rather than only with topology. The ceiling is unreachable, but a
-        // node stuck at it going quiet beats one that starts over at zero.
-        let seq = self.announcement.seq().saturating_add(1);
-        self.announcement = position.with_seq(seq);
+        self.announcement = position;
         self.announced_at = now;
         let message = Message::Announce(self.announcement.clone());
         for &peer in self.peers.keys() {
@@ -521,16 +555,16 @@ impl Node {
     }
 
     /// The most preferred position available: below some peer, or self-rooted.
-    fn best_position(&self) -> Announcement {
-        // The sequence number is irrelevant to the comparison; the caller
-        // stamps the winner with the right one.
-        let seq = self.announcement.seq();
-        let mut best = Announcement::root_of(self.key, seq);
+    ///
+    /// Every candidate is signed as it is built, since a position this node
+    /// cannot sign is not one it could take up.
+    fn best_position(&self, seq: u64) -> Announcement {
+        let mut best = Announcement::root_of(&self.signer, seq);
         for (peer, state) in &self.peers {
             let Some(info) = self.info(peer) else {
                 continue;
             };
-            let Some(candidate) = info.extend(self.key, state.cost, seq) else {
+            let Some(candidate) = info.extend(&self.signer, state.cost, seq) else {
                 continue;
             };
             if candidate.preference_cmp(&best) == Ordering::Less {
@@ -655,27 +689,39 @@ impl Node {
 mod tests {
     use super::*;
     use crate::key::KEY_LEN;
+    use crate::signature::Insecure;
 
     fn key(n: u8) -> PublicKey {
         PublicKey::new([n; KEY_LEN])
+    }
+
+    fn signer(n: u8) -> Insecure {
+        Insecure::for_key(key(n))
     }
 
     fn cost(n: u64) -> Cost {
         Cost::new(n).expect("a test cost is never zero")
     }
 
-    /// A path rooted at `root`, each later node reached over a link of the cost
-    /// written beside it.
-    fn path(root: u8, steps: &[(u8, u64)]) -> Vec<Hop> {
-        let mut path = vec![Hop::root(key(root))];
+    /// An announcement for the node at the end of `root` + `steps`, each hop
+    /// signed by the node that added it.
+    fn announcement(root: u8, steps: &[(u8, u64)]) -> Announcement {
+        let mut announcement = Announcement::root_of(&signer(root), 0);
         for &(node, price) in steps {
-            path.push(Hop::new(key(node), cost(price)));
+            announcement = announcement
+                .extend(&signer(node), cost(price), 0)
+                .expect("the test path holds distinct keys");
         }
-        path
+        announcement
     }
 
-    fn announcement(root: u8, steps: &[(u8, u64)]) -> Announcement {
-        Announcement::new(0, path(root, steps)).expect("the test path is well formed")
+    fn path(root: u8, steps: &[(u8, u64)]) -> Vec<Hop> {
+        announcement(root, steps).path().to_vec()
+    }
+
+    /// The walk a path describes, with the stamps and signatures set aside.
+    fn walk(path: &[Hop]) -> Vec<(PublicKey, u64)> {
+        path.iter().map(|hop| (hop.key, hop.cost)).collect()
     }
 
     /// What the node at the end of `root` + `steps` says about itself.
@@ -701,21 +747,17 @@ mod tests {
 
     /// A node linked to a peer holding a smaller key, having just heard where
     /// that peer sits, so it has taken up a position below it.
-    fn node_below_a_peer(now: u64) -> Node {
-        let mut node = Node::new(0, key(2));
+    fn node_below_a_peer(now: u64) -> Node<Insecure> {
+        let mut node = Node::new(0, signer(2));
         node.add_peer(0, key(1), Cost::UNIT);
-        node.handle(
-            now,
-            key(1),
-            Message::Announce(Announcement::root_of(key(1), 0)),
-        );
+        node.handle(now, key(1), announce(1, &[]));
         node
     }
 
     /// The middle of the line `1 - 2 - 3`: the root above, one child below,
     /// and the child claiming that 3 and 7 lie beyond it.
-    fn middle_of_a_line() -> Node {
-        let mut node = Node::new(0, key(2));
+    fn middle_of_a_line() -> Node<Insecure> {
+        let mut node = Node::new(0, signer(2));
         node.add_peer(0, key(1), Cost::UNIT);
         node.add_peer(0, key(3), Cost::UNIT);
         node.handle(0, key(1), announce(1, &[]));
@@ -733,34 +775,45 @@ mod tests {
 
     #[test]
     fn a_new_node_is_its_own_root() {
-        let node = Node::new(0, key(7));
+        let node = Node::new(0, signer(7));
+        assert_eq!(node.key(), key(7), "its address is what it signs as");
         assert_eq!(node.root(), key(7));
         assert_eq!(node.parent(), None);
         assert_eq!(node.path(), path(7, &[]));
     }
 
     #[test]
+    fn a_node_signs_where_it_says_it_sits() {
+        let node = node_below_a_peer(0);
+        let announcement = Announcement::new::<Insecure>(node.path().to_vec());
+        assert!(
+            announcement.is_ok(),
+            "a node's own announcement must check out: {announcement:?}"
+        );
+    }
+
+    #[test]
     fn adding_a_peer_tells_it_where_this_node_sits() {
-        let mut node = Node::new(0, key(2));
+        let mut node = Node::new(0, signer(2));
         let out = node.add_peer(0, key(1), Cost::UNIT);
         assert_eq!(out.len(), 1, "its own position, and nothing else");
         assert_eq!(out[0].to, key(1));
         assert_eq!(
             out[0].message,
-            Message::Announce(Announcement::root_of(key(2), 0))
+            Message::Announce(Announcement::root_of(&signer(2), 0))
         );
     }
 
     #[test]
     fn a_node_will_not_peer_with_itself() {
-        let mut node = Node::new(0, key(1));
+        let mut node = Node::new(0, signer(1));
         assert!(node.add_peer(0, key(1), Cost::UNIT).is_empty());
         assert_eq!(node.peers().count(), 0);
     }
 
     #[test]
     fn messages_from_strangers_are_ignored() {
-        let mut node = Node::new(0, key(2));
+        let mut node = Node::new(0, signer(2));
         assert!(node.handle(0, key(1), announce(1, &[])).is_empty());
         assert_eq!(node.root(), key(2), "the tree did not move");
     }
@@ -770,12 +823,12 @@ mod tests {
         let node = node_below_a_peer(0);
         assert_eq!(node.root(), key(1));
         assert_eq!(node.parent(), Some(key(1)));
-        assert_eq!(node.path(), path(1, &[(2, 1)]));
+        assert_eq!(walk(node.path()), [(key(1), 0), (key(2), 1)]);
     }
 
     #[test]
     fn a_node_keeps_a_smaller_key_than_its_peer() {
-        let mut node = Node::new(0, key(1));
+        let mut node = Node::new(0, signer(1));
         node.add_peer(0, key(2), Cost::UNIT);
         node.handle(0, key(2), announce(2, &[]));
 
@@ -797,26 +850,73 @@ mod tests {
     }
 
     #[test]
+    fn a_position_that_does_not_check_out_is_not_believed() {
+        let mut node = Node::new(0, signer(3));
+        node.add_peer(0, key(2), Cost::UNIT);
+
+        // 2's genuine announcement, with the price of its link to the root
+        // rubbed out and a cheaper one written in. That would make 2 a better
+        // parent than it has earned, and cost every packet routed through it.
+        let mut tampered = path(1, &[(2, 5)]);
+        tampered[1].cost = 1;
+
+        let out = node.handle(
+            0,
+            key(2),
+            Message::Announce(Announcement::unchecked(tampered)),
+        );
+
+        assert!(out.is_empty());
+        assert_eq!(node.known().count(), 0, "nothing was taken on trust");
+        assert_eq!(node.parent(), None, "and nothing was sat below");
+    }
+
+    #[test]
+    fn an_answer_carrying_a_position_that_does_not_check_out_is_not_believed() {
+        let mut node = middle_of_a_line();
+
+        // A search for 7 comes back with 7 placed somewhere it never signed
+        // for — the cheapest lie a node relaying an answer could tell.
+        let mut tampered = path(1, &[(2, 1), (3, 1), (7, 1)]);
+        tampered[3].cost = 9;
+
+        node.handle(
+            0,
+            key(3),
+            Message::Found(Found {
+                announcement: Announcement::unchecked(tampered),
+                trail: vec![key(2)],
+            }),
+        );
+
+        assert!(
+            !node.known().any(|known| known == key(7)),
+            "an answer is checked exactly as an announcement is"
+        );
+        assert_eq!(node.send(key(7), b"hi".to_vec()), Err(SendError::Unknown));
+    }
+
+    #[test]
     fn a_stale_announcement_changes_nothing() {
-        let mut node = Node::new(0, key(2));
+        let mut node = Node::new(0, signer(2));
         node.add_peer(0, key(1), Cost::UNIT);
 
-        let fresh = Announcement::root_of(key(1), 5);
+        let fresh = Announcement::root_of(&signer(1), 5);
         assert!(!node.handle(0, key(1), Message::Announce(fresh)).is_empty());
 
-        let stale = Announcement::root_of(key(1), 4);
+        let stale = Announcement::root_of(&signer(1), 4);
         assert!(node.handle(0, key(1), Message::Announce(stale)).is_empty());
     }
 
     #[test]
     fn sending_to_a_node_that_has_not_been_looked_up_fails() {
-        let mut node = Node::new(0, key(1));
+        let mut node = Node::new(0, signer(1));
         assert_eq!(node.send(key(9), b"hi".to_vec()), Err(SendError::Unknown));
     }
 
     #[test]
     fn sending_to_oneself_delivers_locally() {
-        let mut node = Node::new(0, key(1));
+        let mut node = Node::new(0, signer(1));
         assert_eq!(node.send(key(1), b"hi".to_vec()), Ok(Vec::new()));
         assert_eq!(
             node.take_delivered(),
@@ -871,7 +971,7 @@ mod tests {
         node.handle(
             expiry - 1,
             key(1),
-            Message::Announce(Announcement::root_of(key(1), 1)),
+            Message::Announce(Announcement::root_of(&signer(1), 1)),
         );
         node.tick(expiry);
 
@@ -888,7 +988,7 @@ mod tests {
         node.handle(
             expiry - 1,
             key(1),
-            Message::Announce(Announcement::root_of(key(1), 0)),
+            Message::Announce(Announcement::root_of(&signer(1), 0)),
         );
         node.tick(expiry);
 
@@ -901,7 +1001,7 @@ mod tests {
 
     #[test]
     fn a_looked_up_position_is_forgotten_like_any_other() {
-        let mut node = Node::new(0, key(5));
+        let mut node = Node::new(0, signer(5));
         node.add_peer(0, key(2), Cost::UNIT);
         node.handle(0, key(2), announce(1, &[(2, 1)]));
         node.handle(0, key(2), found(5, 1, &[(2, 1), (4, 1)]));
@@ -923,7 +1023,7 @@ mod tests {
     #[test]
     fn a_node_reissues_its_own_announcement_on_schedule() {
         let refresh = Timing::DEFAULT.refresh;
-        let mut node = Node::new(0, key(1));
+        let mut node = Node::new(0, signer(1));
         node.add_peer(0, key(2), Cost::UNIT);
 
         assert!(node.tick(refresh - 1).is_empty(), "not due yet");
@@ -933,14 +1033,10 @@ mod tests {
         assert_eq!(out[0].to, key(2));
         assert_eq!(
             out[0].message,
-            Message::Announce(Announcement::root_of(key(1), 1)),
-            "a fresh sequence number on an unchanged path"
+            Message::Announce(Announcement::root_of(&signer(1), 1)),
+            "the same walk, signed afresh for a new sequence number"
         );
-        assert_eq!(
-            node.path(),
-            path(1, &[]),
-            "reissuing does not move the tree"
-        );
+        assert_eq!(walk(node.path()), [(key(1), 0)], "the tree did not move");
     }
 
     #[test]
@@ -952,7 +1048,7 @@ mod tests {
         node.handle(
             1,
             key(1),
-            Message::Announce(Announcement::root_of(key(1), 500)),
+            Message::Announce(Announcement::root_of(&signer(1), 500)),
         );
         node.tick(expiry + 1);
         assert_eq!(node.known().count(), 0);
@@ -962,7 +1058,7 @@ mod tests {
         node.handle(
             expiry + 1,
             key(1),
-            Message::Announce(Announcement::root_of(key(1), 0)),
+            Message::Announce(Announcement::root_of(&signer(1), 0)),
         );
         assert_eq!(node.root(), key(1), "the returning node is believed");
         assert_eq!(node.parent(), Some(key(1)));
@@ -974,7 +1070,7 @@ mod tests {
             refresh: 10,
             expiry: 40,
         };
-        let mut node = Node::with_timing(0, key(2), timing);
+        let mut node = Node::with_timing(0, signer(2), timing);
         node.add_peer(0, key(1), Cost::UNIT);
         node.handle(0, key(1), announce(1, &[]));
 
@@ -986,7 +1082,7 @@ mod tests {
 
     #[test]
     fn a_node_sits_below_whichever_peer_offers_the_cheapest_walk_to_the_root() {
-        let mut node = Node::new(0, key(4));
+        let mut node = Node::new(0, signer(4));
         node.add_peer(0, key(1), cost(10));
         node.add_peer(0, key(2), cost(1));
         node.handle(0, key(1), announce(1, &[]));
@@ -998,13 +1094,13 @@ mod tests {
             Some(key(2)),
             "two cheap links beat one expensive one, though the root is a peer"
         );
-        assert_eq!(node.path(), path(1, &[(2, 1), (4, 1)]));
+        assert_eq!(walk(node.path()), [(key(1), 0), (key(2), 1), (key(4), 1)]);
         assert_eq!(node.cost_to_root(), 2);
     }
 
     #[test]
     fn re_pricing_a_link_moves_a_node() {
-        let mut node = Node::new(0, key(4));
+        let mut node = Node::new(0, signer(4));
         node.add_peer(0, key(1), Cost::UNIT);
         node.add_peer(0, key(2), Cost::UNIT);
         node.handle(0, key(1), announce(1, &[]));
@@ -1035,10 +1131,35 @@ mod tests {
         assert_eq!(node.path(), before);
     }
 
+    #[test]
+    fn a_node_stays_put_when_the_walk_above_it_is_merely_restamped() {
+        let mut node = node_below_a_peer(0);
+        let before = node.path().to_vec();
+
+        // The parent reissues from the same place. Its announcement is a new
+        // value, but the walk it describes is the one this node already sits
+        // on, and saying so again would only make work for everybody below.
+        let out = node.handle(
+            1,
+            key(1),
+            Message::Announce(
+                announcement(1, &[])
+                    .with_seq(&signer(1), 9)
+                    .expect("author"),
+            ),
+        );
+
+        assert!(
+            announces(&out).is_empty(),
+            "nothing moved, so nothing was said"
+        );
+        assert_eq!(node.path(), before);
+    }
+
     /// A node holding key 5, linked to both 2 and 3 — each of them a child of
     /// the root — and told that 4 sits below 2, away from 3.
-    fn node_choosing_between_two_peers(to_two: u64, to_three: u64) -> Node {
-        let mut node = Node::new(0, key(5));
+    fn node_choosing_between_two_peers(to_two: u64, to_three: u64) -> Node<Insecure> {
+        let mut node = Node::new(0, signer(5));
         node.add_peer(0, key(2), cost(to_two));
         node.add_peer(0, key(3), cost(to_three));
         node.handle(0, key(2), announce(1, &[(2, 1)]));

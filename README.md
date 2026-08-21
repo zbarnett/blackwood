@@ -74,6 +74,22 @@ What a node holds is a fixed amount per link, its own position, and the
 positions of the nodes it is currently talking to. Nothing scales with the size
 of the network.
 
+## Signing
+
+Every hop of an announcement carries the signature of the node it names, over
+that hop and over every hop above it exactly as they stand. A walk down the tree
+is a chain of statements, each made by the node it is about: nobody can put a
+node somewhere it has not put itself, and no part of one announcement can be
+lifted into another. That is what makes the answer to a search worth having,
+since answering one is the only time a node speaks about anybody but itself.
+
+The core performs none of it. It says what has to be signed and what has to be
+checked, and takes the algorithm as a type parameter — which is how it carries
+no dependencies and still refuses to take a stranger's word for anything.
+[`Insecure`](src/signature.rs) is that shape with the cryptography left out, for
+running and testing against; [`ed25519/`](ed25519/) is the same shape with real
+keys behind it, and holds the one third-party dependency in this repository.
+
 Announcements are soft state. A node reissues its own on a schedule and forgets
 any it has not heard reissued, so a view repairs itself rather than only
 accumulating: a node that vanishes is eventually forgotten instead of lingering
@@ -89,14 +105,18 @@ handed the current instant by its caller, in whatever unit that caller counts
 in. That is what makes a network of them deterministically simulatable, and what
 should make the argument above tractable to check in a proof assistant.
 
-Cryptography is deliberately absent; [`src/lib.rs`](src/lib.rs) records what it
-would add.
+Two things ironwood does are left out, both hardening rather than part of the
+model: a parent does not sign for its children, so a node can claim to sit below
+a peer that never agreed to it, and summaries and searches are unsigned because
+there is nobody but their sender who could sign them.
+[`src/lib.rs`](src/lib.rs) records what each would cost to close.
 
 ## Layout
 
 | Path | What it is |
 | --- | --- |
 | [`src/`](src/) | The routing core. No dependencies, no I/O, no `unsafe` |
+| [`ed25519/`](ed25519/) | ed25519 injected into the core's signing trait, and the only third-party dependency here |
 | [`tests/simulation.rs`](tests/simulation.rs) | Brings a network up and carries a packet across it |
 | [`viewer/`](viewer/) | The visualiser: a simulator, a small server, and a Svelte page |
 | [`viewer/wasm/`](viewer/wasm/) | The same simulator compiled to WebAssembly, for the hosted demo |

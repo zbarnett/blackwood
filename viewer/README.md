@@ -34,6 +34,7 @@ Click a node to select it, and a second node for the other end of an action.
 | Look up | Asks the network where the second node sits, and rings every node the search passed through |
 | Send packet | Sends one packet from the first selection to the second and animates its route, looking the destination up first if it has to |
 | +1s / +5s | Moves the simulated clock forward, letting nodes reissue and expire announcements |
+| Forge | Alters the first selected node's signed position and offers it to the check every node runs |
 | Reset | Rebuilds the starting network |
 
 The root is ringed in gold, links to a node's parent are solid, every other link
@@ -47,6 +48,13 @@ long way round, by way of `3`, rather than over its own link to `2`. Select
 the network to make it happen, since a link's cost is something each end
 measures for itself. The *cost* column is what the walk from a node up to the
 root costs, and the log prices each packet the same way.
+
+Each node signs with a real ed25519 key, and the *key* column shows the first
+three bytes of it. The root is the smallest of them, which is why the labels are
+handed out in key order when the network is built — a node added later takes the
+next label and whatever key its seed gives it, and may well sort below
+everything already there. Press **Forge** to alter a node's signed position and
+watch the check refuse it.
 
 No node here knows the network. The *knows* column counts the positions a node
 holds, which are its own peers and whoever it has looked up lately — never

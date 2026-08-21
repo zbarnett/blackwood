@@ -1,0 +1,15 @@
+[package]
+name = "blackwood-ed25519"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# The routing core, which performs no cryptography of its own.
+blackwood = { path = ".." }
+
+# The one third-party dependency in this repository, and the reason this crate
+# exists: it is kept on this side of the boundary so the core stays free of it.
+# Default features off, which leaves out the parts that would want a random
+# number generator — keys here come from a seed the caller supplies, so nothing
+# has to ask the operating system for anything and this builds for wasm.
+ed25519-dalek = { version = "3.0.0", default-features = false, features = ["zeroize"] }

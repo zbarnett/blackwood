@@ -7,14 +7,36 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use blackwood::{Cost, Hop, KEY_LEN, Message, Node, Packet, PublicKey, SendError, Timing};
+use blackwood::{
+    Cost, Hop, Insecure, KEY_LEN, Message, Node, Packet, PublicKey, SendError, Timing,
+};
 
 fn key(n: u8) -> PublicKey {
     PublicKey::new([n; KEY_LEN])
 }
 
+/// Every node in this simulation signs with [`Insecure`], so the keys stay
+/// legible and the root is whichever one reads smallest. What real
+/// cryptography does instead is exercised in the `blackwood-ed25519` crate,
+/// against a network built the same way.
+fn signer(key: PublicKey) -> Insecure {
+    Insecure::for_key(key)
+}
+
 fn cost(n: u64) -> Cost {
     Cost::new(n).expect("a test cost is never zero")
+}
+
+/// Where one node believes it sits: the root it answers to, its parent, and
+/// the walk down to it.
+type Position = (PublicKey, Option<PublicKey>, Vec<(PublicKey, u64)>);
+
+/// The walk a path describes, with the stamps and signatures set aside.
+///
+/// Two nodes holding differently stamped copies of the same walk are in the
+/// same place, and that is what these tests mean when they compare positions.
+fn walk(path: &[Hop]) -> Vec<(PublicKey, u64)> {
+    path.iter().map(|hop| (hop.key, hop.cost)).collect()
 }
 
 /// A message in flight, from one node to a linked peer.
@@ -25,7 +47,7 @@ struct InFlight {
 }
 
 struct Network {
-    nodes: BTreeMap<PublicKey, Node>,
+    nodes: BTreeMap<PublicKey, Node<Insecure>>,
     queue: VecDeque<InFlight>,
     /// How many times a packet has been handed to a node, i.e. hops taken.
     hops: usize,
@@ -38,7 +60,10 @@ struct Network {
 impl Network {
     fn new(keys: impl IntoIterator<Item = PublicKey>) -> Self {
         Self {
-            nodes: keys.into_iter().map(|k| (k, Node::new(0, k))).collect(),
+            nodes: keys
+                .into_iter()
+                .map(|k| (k, Node::new(0, signer(k))))
+                .collect(),
             queue: VecDeque::new(),
             hops: 0,
             searched: Vec::new(),
@@ -46,11 +71,11 @@ impl Network {
         }
     }
 
-    fn node(&self, key: PublicKey) -> &Node {
+    fn node(&self, key: PublicKey) -> &Node<Insecure> {
         self.nodes.get(&key).expect("node is in the network")
     }
 
-    fn node_mut(&mut self, key: PublicKey) -> &mut Node {
+    fn node_mut(&mut self, key: PublicKey) -> &mut Node<Insecure> {
         self.nodes.get_mut(&key).expect("node is in the network")
     }
 
@@ -153,11 +178,15 @@ impl Network {
     }
 
     /// Where every node believes it sits, for comparing one moment to another.
-    fn positions(&self, keys: &[PublicKey]) -> Vec<(PublicKey, Option<PublicKey>, Vec<Hop>)> {
+    ///
+    /// The walk, not the announcement: a reissue restamps and re-signs without
+    /// moving anybody, and a node that had gone nowhere would otherwise look
+    /// like one that had.
+    fn positions(&self, keys: &[PublicKey]) -> Vec<Position> {
         keys.iter()
             .map(|&key| {
                 let node = self.node(key);
-                (node.root(), node.parent(), node.path().to_vec())
+                (node.root(), node.parent(), walk(node.path()))
             })
             .collect()
     }
@@ -169,7 +198,7 @@ impl Network {
         for &key in keys {
             let node = self.node(key);
             let Some(parent) = node.parent() else {
-                assert_eq!(node.path(), [Hop::root(key)], "a root's path is itself");
+                assert_eq!(walk(node.path()), [(key, 0)], "a root's path is itself");
                 continue;
             };
             let (_, cost) = node
@@ -177,8 +206,12 @@ impl Network {
                 .find(|(peer, _)| *peer == parent)
                 .expect("a node's parent is one of its peers");
             let (head, tail) = node.path().split_at(node.path().len() - 1);
-            assert_eq!(head, self.node(parent).path(), "path disagrees with parent");
-            assert_eq!(tail, [Hop::new(key, cost)]);
+            assert_eq!(
+                walk(head),
+                walk(self.node(parent).path()),
+                "path disagrees with parent"
+            );
+            assert_eq!(walk(tail), [(key, cost.get())]);
         }
     }
 
@@ -585,7 +618,7 @@ fn a_node_that_starts_over_rejoins_the_tree() {
     // It comes back as a fresh process would: same key, sequence numbers back
     // at zero. Without expiry that announcement would look like ancient news
     // and every node would go on routing towards where e used to be.
-    net.nodes.insert(e, Node::new(net.now, e));
+    net.nodes.insert(e, Node::new(net.now, signer(e)));
     net.link(d, e, Cost::UNIT);
     net.run();
 

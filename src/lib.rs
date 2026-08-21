@@ -90,21 +90,59 @@
 //! the only part that grows with use, and expiry is what bounds it. Nothing
 //! here scales with the size of the network.
 //!
-//! One thing ironwood does is deliberately left out, a hardening of the model
-//! above rather than part of it:
+//! Two things ironwood does are left out, both of them hardening rather than
+//! part of the model above:
 //!
-//! - **Cryptography.** Ironwood signs announcements so a node cannot lie about
-//!   its parent, or about where some other node sits when it answers a search.
-//!   Here a key is an opaque identifier and both are trusted, so this core is
-//!   correct only among honest participants.
+//! - **Consent from a parent.** Every hop here is signed by the node it names,
+//!   so nobody can be placed by anybody else — but a node can still claim to
+//!   sit below a peer that never agreed to it. The claim is largely
+//!   self-defeating, since packets routed to it through that peer are dropped
+//!   by a peer that has no link to it. Ironwood closes it properly: the parent
+//!   signs the hop naming the child, so a position is a bargain rather than an
+//!   assertion. Doing the same here would mean a separate announcement per
+//!   recipient, and the parent rather than the child pricing the link between
+//!   them, which is the whole of why it is not done.
+//! - **Signed summaries and searches.** A [`Summary`] is a claim about one
+//!   link, made by the node on the far end of it, and there is nobody else who
+//!   could sign it. Lying costs a search a wasted detour or an unanswered
+//!   question; it cannot deliver a packet to the wrong node.
+//!
+//! # Signing
+//!
+//! Every hop of an announcement carries the signature of the node it names,
+//! over that hop and over every hop above it exactly as they stand. A walk down
+//! the tree is therefore a chain of statements, each made by the node it is
+//! about: nobody can put a node somewhere it has not put itself, and no part of
+//! one announcement can be lifted into another. That is what makes the answer
+//! to a search worth having, since answering one is the only time a node speaks
+//! about anybody but itself.
+//!
+//! The core performs none of this. It says what has to be signed and what has
+//! to be checked, and takes the algorithm as a type parameter — which is how it
+//! carries no dependencies and still refuses to take a stranger's word for
+//! anything. [`Insecure`] is the shape of an implementation with the
+//! cryptography left out: enough to run and to test against, with no secret
+//! anywhere in it. The `blackwood-ed25519` crate is the same shape with real
+//! keys behind it.
+//!
+//! A signature settles who said something, never whether it is still so. It is
+//! as good on a long-dead announcement as on a fresh one, which is what
+//! sequence numbers and expiry are there for.
 //!
 //! # Example
 //!
 //! ```
-//! use blackwood::{Cost, Message, Node, PublicKey, Timing};
+//! use blackwood::{Cost, Insecure, Node, PublicKey, Timing};
 //!
 //! let (a, b) = (PublicKey::new([1; 32]), PublicKey::new([2; 32]));
-//! let (mut a_node, mut b_node) = (Node::new(0, a), Node::new(0, b));
+//!
+//! // A node's address is whatever key it can sign as. `Insecure` is the shape
+//! // of a signer with the cryptography left out, which is all this crate has
+//! // of its own; `blackwood-ed25519` is the same shape with it put back in.
+//! let (mut a_node, mut b_node) = (
+//!     Node::new(0, Insecure::for_key(a)),
+//!     Node::new(0, Insecure::for_key(b)),
+//! );
 //!
 //! // Bring up the link, then hand each side what the other offered. Nothing
 //! // has been measured about it, so it is priced at a single hop.
@@ -140,14 +178,17 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
+mod hash;
 pub mod key;
 pub mod message;
 pub mod node;
+pub mod signature;
 pub mod summary;
 pub mod tree;
 
 pub use key::{KEY_LEN, PublicKey};
 pub use message::{Envelope, Found, Lookup, Message, Packet, Traffic};
 pub use node::{Node, SendError, Timing};
+pub use signature::{Insecure, SIGNATURE_LEN, Signature, Signer};
 pub use summary::Summary;
 pub use tree::{Announcement, Cost, Hop, MalformedAnnouncement, distance};

@@ -12,7 +12,7 @@
 
 use std::cell::RefCell;
 
-use blackwood_viewer::sim::{Delivery, Id, Search, Sim, json_string};
+use blackwood_viewer::sim::{Delivery, Forgery, Id, Search, Sim, json_string};
 
 thread_local! {
     static SIM: RefCell<Sim> = RefCell::new(Sim::new());
@@ -84,6 +84,15 @@ pub extern "C" fn advance(by: u32) {
     respond(with_sim(|sim| {
         sim.advance(u64::from(by));
         Ok(None)
+    }));
+}
+
+/// Alters a node's position and reports what the check made of it.
+#[unsafe(no_mangle)]
+pub extern "C" fn forge(id: u32) {
+    respond(with_sim(|sim| {
+        sim.forge(id as Id)
+            .map(|forgery: Forgery| Some(forgery.json_fields()))
     }));
 }
 

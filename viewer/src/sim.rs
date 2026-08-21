@@ -8,18 +8,33 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use blackwood::{Cost, Envelope, KEY_LEN, Message, Node, PublicKey, Timing};
+use blackwood::{Announcement, Cost, Envelope, Message, Node, PublicKey, Timing};
+use blackwood_ed25519::Ed25519;
 
-/// A short label for a node, used as its identity throughout the UI.
+/// A short label for a node, shown throughout the UI in place of its key.
+///
+/// It is only a name. A node's address is an ed25519 public key it cannot
+/// choose, and nothing in the protocol has ever heard of these.
 pub type Id = u8;
 
-/// A node's key is its label repeated, so the two convert freely.
-fn key_of(id: Id) -> PublicKey {
-    PublicKey::new([id; KEY_LEN])
+/// The node type this simulation runs: a routing node signing with ed25519.
+type Signed = Node<Ed25519>;
+
+/// The secret a label's node is built from.
+///
+/// Written down rather than drawn from anywhere, so that the same network comes
+/// up the same way every time. A real node wants 32 bytes it did not choose.
+fn seed_for(id: Id) -> [u8; 32] {
+    [id; 32]
 }
 
-fn id_of(key: PublicKey) -> Id {
-    key.as_bytes()[0]
+/// A key abbreviated for display, since the whole of one is 64 hex digits and
+/// the point of showing it at all is that the ordering can be seen.
+fn short_key(key: PublicKey) -> String {
+    key.as_bytes()[..3]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// A message on its way from one node to a linked peer.
@@ -55,6 +70,31 @@ impl Delivery {
     }
 }
 
+/// What became of an attempt to pass off an altered position as genuine.
+pub struct Forgery {
+    /// Whether the node's real position still checks out, which it always
+    /// does — reported so that a refusal below cannot be mistaken for a check
+    /// that simply says no to everything.
+    pub genuine: bool,
+    /// Why the altered one was refused, or `None` if it got through, which
+    /// would mean the signatures were doing nothing.
+    pub refused: Option<String>,
+}
+
+impl Forgery {
+    /// The JSON fields a caller adds to its response, without the braces.
+    pub fn json_fields(&self) -> String {
+        format!(
+            r#""genuine":{},"refused":{}"#,
+            self.genuine,
+            match &self.refused {
+                Some(why) => json_string(why),
+                None => "null".into(),
+            }
+        )
+    }
+}
+
 /// The outcome of one search.
 pub struct Search {
     /// The nodes it passed through, in the order they saw it.
@@ -76,7 +116,12 @@ impl Search {
 
 /// Everything the viewer knows.
 pub struct Sim {
-    nodes: BTreeMap<Id, Node>,
+    nodes: BTreeMap<Id, Signed>,
+    /// What each label's key is, and which label a key belongs to. Keys are
+    /// derived from a secret and so arrive in no particular order; these two
+    /// maps are the whole of the UI's right to call one of them "node 3".
+    keys: BTreeMap<Id, PublicKey>,
+    ids: BTreeMap<PublicKey, Id>,
     /// Links and what each costs to cross, each held once with the smaller
     /// label first. Both ends of a link agree on its cost here; a node itself
     /// makes no such assumption, since each end measures for itself.
@@ -110,6 +155,8 @@ impl Sim {
     pub fn new() -> Self {
         let mut sim = Self {
             nodes: BTreeMap::new(),
+            keys: BTreeMap::new(),
+            ids: BTreeMap::new(),
             links: BTreeMap::new(),
             queue: VecDeque::new(),
             now: 0,
@@ -118,11 +165,22 @@ impl Sim {
             searched: Vec::new(),
             version: 0,
         };
-        // These cannot fail: the labels are fresh, the links are between
-        // distinct nodes that were just created, and no cost is zero.
-        for _ in 0..6 {
-            let _ = sim.add_node();
+        // Labels are handed out in key order for the network the viewer opens
+        // on, so that node 1 holds the smallest key, is therefore the root, and
+        // the demo reads the same way every time. Nothing in the protocol knows
+        // about this: a node added later takes the next label and whatever key
+        // its seed gives it, which may well sort below everything already here.
+        let mut signers: Vec<Ed25519> =
+            (1..=6).map(|seed| Ed25519::from_seed([seed; 32])).collect();
+        signers.sort_by_key(Ed25519::key);
+        for signer in signers {
+            let id = sim.next_id;
+            sim.next_id += 1;
+            sim.adopt(id, signer);
         }
+
+        // These cannot fail: the links are between distinct nodes that were
+        // just created, and no cost is zero.
         // The 2-4 link is the short way round and the dear one, so the tree
         // that forms is the cheapest one rather than the shallowest. 6 hangs
         // off 2 on a branch of its own, which is what gives a search somewhere
@@ -149,20 +207,29 @@ impl Sim {
             return Err("out of labels".into());
         }
         self.next_id += 1;
-        self.nodes.insert(id, Node::new(self.now, key_of(id)));
+        self.adopt(id, Ed25519::from_seed(seed_for(id)));
         self.note(&format!("added node {id}"));
         Ok(id)
     }
 
+    /// Puts a node into the network under a label, and records which key that
+    /// label stands for.
+    fn adopt(&mut self, id: Id, signer: Ed25519) {
+        let key = signer.key();
+        self.keys.insert(id, key);
+        self.ids.insert(key, id);
+        self.nodes.insert(id, Node::new(self.now, signer));
+    }
+
     /// Removes a node and every link it held.
     pub fn remove_node(&mut self, id: Id) -> Result<(), String> {
-        if !self.nodes.contains_key(&id) {
-            return Err(format!("no node {id}"));
-        }
+        let key = self.require(id)?;
         for peer in self.peers_of(id) {
             self.unlink(id, peer);
         }
         self.nodes.remove(&id);
+        self.keys.remove(&id);
+        self.ids.remove(&key);
         self.run();
         self.note(&format!("removed node {id}"));
         Ok(())
@@ -252,9 +319,9 @@ impl Sim {
     /// summary has filled up enough to stop ruling anything out.
     pub fn look_up(&mut self, from: Id, to: Id) -> Result<Search, String> {
         self.require(from)?;
-        self.require(to)?;
 
-        let outbound = self.node(from)?.lookup(key_of(to));
+        let target = self.require(to)?;
+        let outbound = self.node(from)?.lookup(target);
         self.searched.clear();
         self.enqueue(from, outbound);
         self.run();
@@ -273,11 +340,45 @@ impl Sim {
         Ok(Search { visited, found })
     }
 
+    /// Alters a node's real position and offers the result to the same check
+    /// every node runs on everything it is told.
+    ///
+    /// The lie is a forged reissue: the sequence number moved on by one, and
+    /// nothing else touched. That is the one alteration that would matter most
+    /// — it would let anybody keep a node that had vanished looking alive,
+    /// which is exactly what expiry exists to prevent.
+    ///
+    /// Nothing is injected into the running network. `Announcement::new` is the
+    /// door every announcement arriving from a link comes through, and this
+    /// shows what happens at it.
+    pub fn forge(&mut self, id: Id) -> Result<Forgery, String> {
+        self.require(id)?;
+        let mut path = self.node(id)?.path().to_vec();
+        let genuine = Announcement::new::<Ed25519>(path.clone()).is_ok();
+
+        // The path is never empty, so there is always a last hop.
+        let last = path.len() - 1;
+        path[last].seq = path[last].seq.saturating_add(1);
+        let refused = match Announcement::new::<Ed25519>(path) {
+            Ok(_) => None,
+            Err(why) => Some(why.to_string()),
+        };
+
+        self.note(&match (&refused, genuine) {
+            (Some(why), true) => format!("forged a reissue of {id}: refused, {why}"),
+            (Some(why), false) => format!(
+                "forged a reissue of {id}: refused, {why} (and so was the real one, which is a bug)"
+            ),
+            (None, _) => format!("forged a reissue of {id}: accepted, which is a bug"),
+        });
+        Ok(Forgery { genuine, refused })
+    }
+
     /// Sends one packet and traces the path it took, looking the destination
     /// up first if this node does not already hold its position.
     pub fn send(&mut self, from: Id, to: Id) -> Result<Delivery, String> {
         self.require(from)?;
-        self.require(to)?;
+        let target = self.require(to)?;
 
         // A node holds the position of its peers and of whoever it has looked
         // up lately. Anything else has to be found before it can be addressed.
@@ -289,7 +390,7 @@ impl Sim {
 
         let outbound = self
             .node_mut(from)?
-            .send(key_of(to), b"hello".to_vec())
+            .send(target, b"hello".to_vec())
             .map_err(|error| format!("{from} to {to}: {error}"))?;
 
         // Forwarding a packet yields at most one packet, so following it is a
@@ -303,11 +404,10 @@ impl Sim {
             let Message::Traffic(_) = envelope.message else {
                 break;
             };
-            let next = id_of(envelope.to);
+            let next = self.id_of(envelope.to);
             route.push(next);
-            let produced = self
-                .node_mut(next)?
-                .handle(now, key_of(carrier), envelope.message);
+            let from_key = self.require(carrier)?;
+            let produced = self.node_mut(next)?.handle(now, from_key, envelope.message);
             carrier = next;
             hop = produced.into_iter().next();
         }
@@ -335,15 +435,16 @@ impl Sim {
             .iter()
             .map(|(id, node)| {
                 format!(
-                    r#"{{"id":{id},"root":{},"parent":{},"path":{},"cost":{},"peers":{},"knows":{}}}"#,
-                    id_of(node.root()),
+                    r#"{{"id":{id},"key":{},"root":{},"parent":{},"path":{},"cost":{},"peers":{},"knows":{}}}"#,
+                    json_string(&short_key(node.key())),
+                    self.id_of(node.root()),
                     match node.parent() {
-                        Some(parent) => id_of(parent).to_string(),
+                        Some(parent) => self.id_of(parent).to_string(),
                         None => "null".into(),
                     },
-                    json_ids(node.path().iter().map(|hop| id_of(hop.key))),
+                    json_ids(node.path().iter().map(|hop| self.id_of(hop.key))),
                     node.cost_to_root(),
-                    json_ids(node.peers().map(|(peer, _)| id_of(peer))),
+                    json_ids(node.peers().map(|(peer, _)| self.id_of(peer))),
                     node.known().count(),
                 )
             })
@@ -388,10 +489,13 @@ impl Sim {
     /// How full the summary `from` sends `to` is, or `null` where the link is
     /// not part of the tree and so carries no summary at all.
     fn summary_across(&self, from: Id, to: Id) -> String {
+        let Ok(peer) = self.require(to) else {
+            return "null".into();
+        };
         match self
             .nodes
             .get(&from)
-            .and_then(|node| node.summary_for(key_of(to)))
+            .and_then(|node| node.summary_for(peer))
         {
             Some(summary) => summary.filled().to_string(),
             None => "null".into(),
@@ -400,34 +504,47 @@ impl Sim {
 
     /// Whether `from` holds a position for `to` and could address it now.
     fn knows(&self, from: Id, to: Id) -> bool {
+        let Ok(target) = self.require(to) else {
+            return false;
+        };
         self.nodes
             .get(&from)
-            .is_some_and(|node| node.known().any(|known| known == key_of(to)))
+            .is_some_and(|node| node.known().any(|known| known == target))
     }
 
-    fn require(&self, id: Id) -> Result<(), String> {
-        if self.nodes.contains_key(&id) {
-            Ok(())
-        } else {
-            Err(format!("no node {id}"))
-        }
+    /// The key a label stands for, or an error naming the label that has none.
+    fn require(&self, id: Id) -> Result<PublicKey, String> {
+        self.keys
+            .get(&id)
+            .copied()
+            .ok_or_else(|| format!("no node {id}"))
     }
 
-    fn node(&self, id: Id) -> Result<&Node, String> {
+    /// The label a key goes by here.
+    ///
+    /// Every key the simulation handles belongs to one of its own nodes, so
+    /// the fallback stands for a state this cannot reach; labels start at one,
+    /// which leaves zero free to be visibly wrong if it ever did.
+    fn id_of(&self, key: PublicKey) -> Id {
+        self.ids.get(&key).copied().unwrap_or(0)
+    }
+
+    fn node(&self, id: Id) -> Result<&Signed, String> {
         self.nodes.get(&id).ok_or(format!("no node {id}"))
     }
 
-    fn node_mut(&mut self, id: Id) -> Result<&mut Node, String> {
+    fn node_mut(&mut self, id: Id) -> Result<&mut Signed, String> {
         self.nodes.get_mut(&id).ok_or(format!("no node {id}"))
     }
 
     fn parent_of(&self, id: Id) -> Option<Id> {
-        self.nodes.get(&id)?.parent().map(id_of)
+        let parent = self.nodes.get(&id)?.parent()?;
+        Some(self.id_of(parent))
     }
 
     fn peers_of(&self, id: Id) -> Vec<Id> {
         match self.nodes.get(&id) {
-            Some(node) => node.peers().map(|(peer, _)| id_of(peer)).collect(),
+            Some(node) => node.peers().map(|(peer, _)| self.id_of(peer)).collect(),
             None => Vec::new(),
         }
     }
@@ -449,10 +566,11 @@ impl Sim {
         self.links.insert(ordered(a, b), cost);
         let now = self.now;
         for (near, far) in [(a, b), (b, a)] {
-            if let Ok(node) = self.node_mut(near) {
-                let outbound = node.add_peer(now, key_of(far), cost);
-                self.enqueue(near, outbound);
-            }
+            let (Ok(far_key), Some(node)) = (self.require(far), self.nodes.get_mut(&near)) else {
+                continue;
+            };
+            let outbound = node.add_peer(now, far_key, cost);
+            self.enqueue(near, outbound);
         }
         self.run();
     }
@@ -462,18 +580,22 @@ impl Sim {
         self.links.remove(&ordered(a, b));
         let now = self.now;
         for (near, far) in [(a, b), (b, a)] {
-            if let Ok(node) = self.node_mut(near) {
-                let outbound = node.remove_peer(now, key_of(far));
-                self.enqueue(near, outbound);
-            }
+            let (Ok(far_key), Some(node)) = (self.require(far), self.nodes.get_mut(&near)) else {
+                continue;
+            };
+            let outbound = node.remove_peer(now, far_key);
+            self.enqueue(near, outbound);
         }
     }
 
     fn enqueue(&mut self, from: Id, outbound: Vec<Envelope>) {
+        let Ok(from_key) = self.require(from) else {
+            return;
+        };
         for envelope in outbound {
             self.queue.push_back(InFlight {
                 to: envelope.to,
-                from: key_of(from),
+                from: from_key,
                 message: envelope.message,
             });
         }
@@ -491,15 +613,16 @@ impl Sim {
             let Some(in_flight) = self.queue.pop_front() else {
                 return;
             };
+            let holder = self.id_of(in_flight.to);
             if matches!(in_flight.message, Message::Lookup(_)) {
-                self.searched.push(id_of(in_flight.to));
+                self.searched.push(holder);
             }
             let now = self.now;
-            let Ok(node) = self.node_mut(id_of(in_flight.to)) else {
+            let Ok(node) = self.node_mut(holder) else {
                 continue;
             };
             let outbound = node.handle(now, in_flight.from, in_flight.message);
-            self.enqueue(id_of(in_flight.to), outbound);
+            self.enqueue(holder, outbound);
         }
     }
 

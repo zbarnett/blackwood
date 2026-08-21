@@ -48,6 +48,12 @@
     flight = { route: body.route, delivered: body.delivered, at: Date.now() };
   }
 
+  async function forge() {
+    flight = null;
+    search = null;
+    await call('forge', { id: from });
+  }
+
   async function lookUp() {
     flight = null;
     const body = await call('lookup', { from, to });
@@ -90,6 +96,9 @@
         {transport.kind === 'wasm' ? 'wasm' : 'local server'}
       </span>
     {/if}
+    <span class="badge" title="every announcement here is signed with a real ed25519 key and checked hop by hop; the core itself performs no cryptography and takes the algorithm from outside">
+      ed25519
+    </span>
     <span class="badge clock" title="the simulated clock — nothing expires or is reissued until you move it">
       t {clock}s
     </span>
@@ -136,6 +145,13 @@
         +5s
       </button>
       <span class="divider"></span>
+      <button
+        disabled={from === undefined}
+        title="alter the first selected node's signed position and offer it to the check every node runs"
+        onclick={forge}
+      >
+        Forge
+      </button>
       <button onclick={() => { selected = []; flight = null; search = null; call('reset'); }}>Reset</button>
     </div>
 
@@ -167,12 +183,13 @@
     <h2>Nodes</h2>
     <table>
       <thead>
-        <tr><th>id</th><th>root</th><th>parent</th><th>path</th><th title="what the walk from this node up to the root costs">cost</th><th>peers</th><th title="the positions it holds: its peers, and whoever it has looked up and not yet forgotten">knows</th></tr>
+        <tr><th>id</th><th title="the first three bytes of its ed25519 public key — the address it actually answers to, and what the root is chosen by">key</th><th>root</th><th>parent</th><th>path</th><th title="what the walk from this node up to the root costs">cost</th><th>peers</th><th title="the positions it holds: its peers, and whoever it has looked up and not yet forgotten">knows</th></tr>
       </thead>
       <tbody>
         {#each nodes as node (node.id)}
           <tr class:selected={selected.includes(node.id)} onclick={() => pick(node.id)}>
             <td>{node.id}</td>
+            <td class="mono dim">{node.key}</td>
             <td>{node.root}</td>
             <td>{node.parent ?? '—'}</td>
             <td class="mono">{node.path.join('·')}</td>
@@ -199,6 +216,16 @@
         <li>{line}</li>
       {/each}
     </ol>
+
+    <p class="caveat">
+      A node's address is an ed25519 public key it cannot choose, and the
+      <em>key</em> column shows the first three bytes of each. That is what the
+      root is picked by, not the label. Every announcement is signed hop by hop
+      by the node each hop names, so nobody can place anybody but themselves —
+      press <strong>Forge</strong> to alter a node's signed position and watch
+      the check refuse it. The routing core does none of this itself: it says
+      what has to be signed, and the algorithm arrives from outside it.
+    </p>
 
     <p class="caveat">
       No node here knows the network. The <em>knows</em> column counts the
@@ -255,7 +282,7 @@
 
   main {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) 320px;
+    grid-template-columns: minmax(0, 1fr) 368px;
     gap: 20px;
     padding: 10px 22px 26px;
     align-items: start;
@@ -283,8 +310,8 @@
   .legend .swatch.searched { background: none; border: 2px dashed var(--good); height: 12px; width: 12px; border-radius: 50%; }
 
   table { width: 100%; border-collapse: collapse; font-size: 12px; }
-  th { text-align: left; color: var(--dim); font-weight: 500; padding: 3px 6px; }
-  td { padding: 4px 6px; border-top: 1px solid var(--line); }
+  th { text-align: left; color: var(--dim); font-weight: 500; padding: 3px 5px; white-space: nowrap; }
+  td { padding: 4px 5px; border-top: 1px solid var(--line); white-space: nowrap; }
   tbody tr { cursor: pointer; }
   tbody tr:hover { background: #ffffff08; }
   tbody tr.selected { background: #2f3a4d80; }

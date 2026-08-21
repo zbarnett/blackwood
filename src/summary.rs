@@ -2,6 +2,7 @@
 
 use std::fmt;
 
+use crate::hash::{fnv1a, mix};
 use crate::key::PublicKey;
 
 /// The set of keys reachable through one link, as a Bloom filter.
@@ -91,23 +92,11 @@ impl fmt::Debug for Summary {
 
 /// Which bit `key` sets on the given round.
 ///
-/// FNV-1a, then the mix that finishes a murmur hash. The mix is not decoration:
-/// the bit index is taken from the bottom of the word, and those are the bits
-/// FNV moves least, so without it keys that share a suffix would pile onto the
-/// same handful of positions.
+/// The mix after the hash is not decoration: the bit index is taken from the
+/// bottom of the word, and those are the bits FNV moves least, so without it
+/// keys that share a suffix would pile onto the same handful of positions.
 fn position(key: PublicKey, round: usize) -> usize {
-    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-    const PRIME: u64 = 0x0000_0100_0000_01b3;
-
-    let mut hash = OFFSET;
-    for byte in std::iter::once(round as u8).chain(key.as_bytes().iter().copied()) {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(PRIME);
-    }
-    hash ^= hash >> 33;
-    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    hash ^= hash >> 33;
-
+    let hash = mix(fnv1a(round as u8, key.as_bytes().iter().copied()));
     // `BITS` is a power of two, so this is a remainder and cannot exceed it.
     (hash as usize) & (Summary::BITS - 1)
 }
