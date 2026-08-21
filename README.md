@@ -85,10 +85,13 @@ since answering one is the only time a node speaks about anybody but itself.
 
 The core performs none of it. It says what has to be signed and what has to be
 checked, and takes the algorithm as a type parameter — which is how it carries
-no dependencies and still refuses to take a stranger's word for anything.
-[`Insecure`](src/signature.rs) is that shape with the cryptography left out, for
-running and testing against; [`ed25519/`](ed25519/) is the same shape with real
-keys behind it, and holds the one third-party dependency in this repository.
+no dependencies and still refuses to take a stranger's word for anything. There
+is no default and nothing to opt out of: a node cannot be built without a
+[`Signer`](routing-core/src/signature.rs), so whatever a network is running,
+somebody chose it. [`ed25519/`](ed25519/) is that choice made with real keys,
+and holds the one third-party dependency in this repository. The tests supply a
+stand-in with the cryptography left out, which the core cannot tell apart from
+the real thing — that being the point — and which is compiled only for them.
 
 Announcements are soft state. A node reissues its own on a schedule and forgets
 any it has not heard reissued, so a view repairs itself rather than only
@@ -109,22 +112,23 @@ Two things ironwood does are left out, both hardening rather than part of the
 model: a parent does not sign for its children, so a node can claim to sit below
 a peer that never agreed to it, and summaries and searches are unsigned because
 there is nobody but their sender who could sign them.
-[`src/lib.rs`](src/lib.rs) records what each would cost to close.
+[`routing-core/src/lib.rs`](routing-core/src/lib.rs) records what each would
+cost to close.
 
 ## Layout
 
 | Path | What it is |
 | --- | --- |
-| [`src/`](src/) | The routing core. No dependencies, no I/O, no `unsafe` |
+| [`routing-core/`](routing-core/) | The routing core. No dependencies, no I/O, no `unsafe` |
 | [`ed25519/`](ed25519/) | ed25519 injected into the core's signing trait, and the only third-party dependency here |
-| [`tests/simulation.rs`](tests/simulation.rs) | Brings a network up and carries a packet across it |
+| [`routing-core/tests/simulation.rs`](routing-core/tests/simulation.rs) | Brings a network up and carries a packet across it |
 | [`viewer/`](viewer/) | The visualiser: a simulator, a small server, and a Svelte page |
 | [`viewer/wasm/`](viewer/wasm/) | The same simulator compiled to WebAssembly, for the hosted demo |
 
 ## Running it
 
 ```sh
-cargo test --workspace          # the core and its simulation
+cargo test --workspace          # the core, its simulation, and the ed25519 network
 
 cd viewer/ui && npm install && npm run build
 cargo run -p blackwood-viewer   # then open http://127.0.0.1:8080

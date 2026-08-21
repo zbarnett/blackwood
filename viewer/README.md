@@ -1,6 +1,6 @@
 # blackwood viewer
 
-A local visualiser for a simulated [`blackwood`](..) network: every node, every
+A local visualiser for a simulated [`routing-core`](../routing-core) network: every node, every
 link, and the route a packet takes across them.
 
 The network being shown is entirely in memory. Nodes hand each other messages as

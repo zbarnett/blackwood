@@ -1,9 +1,3 @@
-[package]
-name = "blackwood"
-version = "0.1.0"
-edition = "2024"
-
-[dependencies]
-
 [workspace]
-members = ["ed25519", "viewer", "viewer/wasm"]
+resolver = "3"
+members = ["routing-core", "ed25519", "viewer", "viewer/wasm"]

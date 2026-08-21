@@ -3,23 +3,19 @@
 version = 4
 
 [[package]]
-name = "blackwood"
-version = "0.1.0"
-
-[[package]]
 name = "blackwood-ed25519"
 version = "0.1.0"
 dependencies = [
- "blackwood",
  "ed25519-dalek",
+ "routing-core",
 ]
 
 [[package]]
 name = "blackwood-viewer"
 version = "0.1.0"
 dependencies = [
- "blackwood",
  "blackwood-ed25519",
+ "routing-core",
 ]
 
 [[package]]
@@ -159,6 +155,10 @@ checksum = "1fbf4db142a473a8d80c26bbf18454ed458bf8d26c8219c331daecfdbd079001"
 dependencies = [
  "proc-macro2",
 ]
+
+[[package]]
+name = "routing-core"
+version = "0.1.0"
 
 [[package]]
 name = "rustc_version"

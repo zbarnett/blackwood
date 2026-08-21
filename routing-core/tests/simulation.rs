@@ -7,20 +7,59 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use blackwood::{
-    Cost, Hop, Insecure, KEY_LEN, Message, Node, Packet, PublicKey, SendError, Timing,
+use routing_core::{
+    Cost, Hop, KEY_LEN, Message, Node, Packet, PublicKey, SIGNATURE_LEN, SendError, Signature,
+    Signer, Timing,
 };
 
 fn key(n: u8) -> PublicKey {
     PublicKey::new([n; KEY_LEN])
 }
 
-/// Every node in this simulation signs with [`Insecure`], so the keys stay
-/// legible and the root is whichever one reads smallest. What real
-/// cryptography does instead is exercised in the `blackwood-ed25519` crate,
-/// against a network built the same way.
-fn signer(key: PublicKey) -> Insecure {
-    Insecure::for_key(key)
+/// A signer with the cryptography left out, which is what lets this simulation
+/// use keys that read as `01`, `02`, `03` and still drive exactly the code a
+/// real network runs — the core cannot tell one signer from another.
+///
+/// A signature is a hash of the key and the message, so it changes with what it
+/// covers, and anybody can produce one for anybody. Nothing here forges
+/// anything; that, and what real cryptography does instead, is exercised in the
+/// `blackwood-ed25519` crate against a network built the same way.
+struct StandIn(PublicKey);
+
+impl Signer for StandIn {
+    fn public_key(&self) -> PublicKey {
+        self.0
+    }
+
+    fn sign(&self, message: &[u8]) -> Signature {
+        stamp(self.0, message)
+    }
+
+    fn verify(key: PublicKey, message: &[u8], signature: &Signature) -> bool {
+        &stamp(key, message) == signature
+    }
+}
+
+/// FNV-1a over the key and the message, salted per eight-byte chunk so that one
+/// input fills a whole signature.
+fn stamp(key: PublicKey, message: &[u8]) -> Signature {
+    let mut bytes = [0; SIGNATURE_LEN];
+    for (round, chunk) in bytes.chunks_mut(8).enumerate() {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in std::iter::once(round as u8)
+            .chain(key.as_bytes().iter().copied())
+            .chain(message.iter().copied())
+        {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        // Every chunk of a 64-byte array split eight ways is eight bytes long.
+        chunk.copy_from_slice(&hash.to_be_bytes());
+    }
+    Signature::new(bytes)
+}
+
+fn signer(key: PublicKey) -> StandIn {
+    StandIn(key)
 }
 
 fn cost(n: u64) -> Cost {
@@ -47,7 +86,7 @@ struct InFlight {
 }
 
 struct Network {
-    nodes: BTreeMap<PublicKey, Node<Insecure>>,
+    nodes: BTreeMap<PublicKey, Node<StandIn>>,
     queue: VecDeque<InFlight>,
     /// How many times a packet has been handed to a node, i.e. hops taken.
     hops: usize,
@@ -71,11 +110,11 @@ impl Network {
         }
     }
 
-    fn node(&self, key: PublicKey) -> &Node<Insecure> {
+    fn node(&self, key: PublicKey) -> &Node<StandIn> {
         self.nodes.get(&key).expect("node is in the network")
     }
 
-    fn node_mut(&mut self, key: PublicKey) -> &mut Node<Insecure> {
+    fn node_mut(&mut self, key: PublicKey) -> &mut Node<StandIn> {
         self.nodes.get_mut(&key).expect("node is in the network")
     }
 
@@ -120,7 +159,7 @@ impl Network {
         }
     }
 
-    fn enqueue(&mut self, from: PublicKey, outbound: Vec<blackwood::Envelope>) {
+    fn enqueue(&mut self, from: PublicKey, outbound: Vec<routing_core::Envelope>) {
         for envelope in outbound {
             self.queue.push_back(InFlight {
                 to: envelope.to,

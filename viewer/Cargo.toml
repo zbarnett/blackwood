@@ -6,5 +6,5 @@ edition = "2024"
 [dependencies]
 # The routing core, and the ed25519 that gets injected into it. The viewer
 # runs the real thing: every announcement it draws was signed and checked.
-blackwood = { path = ".." }
+routing-core = { path = "../routing-core" }
 blackwood-ed25519 = { path = "../ed25519" }

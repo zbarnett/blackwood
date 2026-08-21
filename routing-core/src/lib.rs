@@ -120,10 +120,12 @@
 //! The core performs none of this. It says what has to be signed and what has
 //! to be checked, and takes the algorithm as a type parameter — which is how it
 //! carries no dependencies and still refuses to take a stranger's word for
-//! anything. [`Insecure`] is the shape of an implementation with the
-//! cryptography left out: enough to run and to test against, with no secret
-//! anywhere in it. The `blackwood-ed25519` crate is the same shape with real
-//! keys behind it.
+//! anything. There is nothing to opt out of and no stand-in shipped here to
+//! reach for by accident: a [`Node`] cannot be built without a [`Signer`], so
+//! whatever a network is running, somebody chose it. The `blackwood-ed25519`
+//! crate is that choice made with real keys behind it, and the example below
+//! is the smallest thing the trait will accept, written out so that what a
+//! caller has to supply is on the page.
 //!
 //! A signature settles who said something, never whether it is still so. It is
 //! as good on a long-dead announcement as on a fresh one, which is what
@@ -132,16 +134,40 @@
 //! # Example
 //!
 //! ```
-//! use blackwood::{Cost, Insecure, Node, PublicKey, Timing};
+//! use routing_core::{
+//!     Cost, KEY_LEN, Node, PublicKey, SIGNATURE_LEN, Signature, Signer, Timing,
+//! };
+//!
+//! // The algorithm arrives from outside, so an example has to bring one. This
+//! // one is worth nothing on purpose: a signature here is the signer's own key
+//! // written out, and anybody can write out anybody's key. It is the whole of
+//! // what the trait asks for, which is the point of showing it —
+//! // `blackwood-ed25519` is the same four methods over real keys.
+//! struct NoSecret(PublicKey);
+//!
+//! impl Signer for NoSecret {
+//!     fn public_key(&self) -> PublicKey {
+//!         self.0
+//!     }
+//!
+//!     fn sign(&self, _message: &[u8]) -> Signature {
+//!         let mut bytes = [0; SIGNATURE_LEN];
+//!         bytes[..KEY_LEN].copy_from_slice(self.0.as_bytes());
+//!         Signature::new(bytes)
+//!     }
+//!
+//!     fn verify(key: PublicKey, _message: &[u8], signature: &Signature) -> bool {
+//!         signature.as_bytes()[..KEY_LEN] == key.as_bytes()[..]
+//!     }
+//! }
 //!
 //! let (a, b) = (PublicKey::new([1; 32]), PublicKey::new([2; 32]));
 //!
-//! // A node's address is whatever key it can sign as. `Insecure` is the shape
-//! // of a signer with the cryptography left out, which is all this crate has
-//! // of its own; `blackwood-ed25519` is the same shape with it put back in.
+//! // A node's address is whatever key it can sign as, so an identity and the
+//! // means of proving it arrive together and cannot come apart.
 //! let (mut a_node, mut b_node) = (
-//!     Node::new(0, Insecure::for_key(a)),
-//!     Node::new(0, Insecure::for_key(b)),
+//!     Node::new(0, NoSecret(a)),
+//!     Node::new(0, NoSecret(b)),
 //! );
 //!
 //! // Bring up the link, then hand each side what the other offered. Nothing
@@ -186,9 +212,15 @@ pub mod signature;
 pub mod summary;
 pub mod tree;
 
+/// A signer with the cryptography left out, so that the tests in this crate
+/// can drive the core without one. Compiled only for those tests, and so
+/// unreachable from anywhere a real network could run.
+#[cfg(test)]
+mod stand_in;
+
 pub use key::{KEY_LEN, PublicKey};
 pub use message::{Envelope, Found, Lookup, Message, Packet, Traffic};
 pub use node::{Node, SendError, Timing};
-pub use signature::{Insecure, SIGNATURE_LEN, Signature, Signer};
+pub use signature::{SIGNATURE_LEN, Signature, Signer};
 pub use summary::Summary;
 pub use tree::{Announcement, Cost, Hop, MalformedAnnouncement, distance};

@@ -374,14 +374,14 @@ fn signed_bytes(above: &[Hop], key: PublicKey, cost: u64, seq: u64) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::signature::Insecure;
+    use crate::stand_in::StandIn;
 
     fn key(n: u8) -> PublicKey {
         PublicKey::new([n; crate::key::KEY_LEN])
     }
 
-    fn signer(n: u8) -> Insecure {
-        Insecure::for_key(key(n))
+    fn signer(n: u8) -> StandIn {
+        StandIn::for_key(key(n))
     }
 
     fn cost(n: u64) -> Cost {
@@ -420,7 +420,7 @@ mod tests {
     #[test]
     fn rejects_malformed_paths() {
         assert_eq!(
-            Announcement::new::<Insecure>(vec![]),
+            Announcement::new::<StandIn>(vec![]),
             Err(MalformedAnnouncement::EmptyPath)
         );
 
@@ -430,25 +430,25 @@ mod tests {
             ..repeated[1]
         });
         assert_eq!(
-            Announcement::new::<Insecure>(repeated),
+            Announcement::new::<StandIn>(repeated),
             Err(MalformedAnnouncement::RepeatedKey)
         );
 
         let mut priced_root = path(1, &[]);
         priced_root[0].cost = 1;
         assert_eq!(
-            Announcement::new::<Insecure>(priced_root),
+            Announcement::new::<StandIn>(priced_root),
             Err(MalformedAnnouncement::CostAtRoot)
         );
 
         let mut free = path(1, &[(2, 1)]);
         free[1].cost = 0;
         assert_eq!(
-            Announcement::new::<Insecure>(free),
+            Announcement::new::<StandIn>(free),
             Err(MalformedAnnouncement::FreeLink)
         );
 
-        assert!(Announcement::new::<Insecure>(path(1, &[(2, 3)])).is_ok());
+        assert!(Announcement::new::<StandIn>(path(1, &[(2, 3)])).is_ok());
     }
 
     #[test]
@@ -459,21 +459,21 @@ mod tests {
         let mut cheaper = path(1, &[(2, 5)]);
         cheaper[1].cost = 1;
         assert_eq!(
-            Announcement::new::<Insecure>(cheaper),
+            Announcement::new::<StandIn>(cheaper),
             Err(MalformedAnnouncement::BadSignature)
         );
 
         let mut renamed = path(1, &[(2, 1)]);
         renamed[1].key = key(9);
         assert_eq!(
-            Announcement::new::<Insecure>(renamed),
+            Announcement::new::<StandIn>(renamed),
             Err(MalformedAnnouncement::BadSignature)
         );
 
         let mut restamped = path(1, &[(2, 1)]);
         restamped[1].seq = 500;
         assert_eq!(
-            Announcement::new::<Insecure>(restamped),
+            Announcement::new::<StandIn>(restamped),
             Err(MalformedAnnouncement::BadSignature)
         );
     }
@@ -481,7 +481,7 @@ mod tests {
     #[test]
     fn every_hop_is_signed_by_the_node_it_names() {
         let announcement = announcement(1, &[(2, 1), (3, 1)]);
-        assert!(announcement.verify::<Insecure>());
+        assert!(announcement.verify::<StandIn>());
 
         // Not one signature over the whole thing by the author: three, one per
         // node, so no single node's word covers anybody else's position.
@@ -512,7 +512,7 @@ mod tests {
         assert_eq!(spliced[2].cost, below_four.path()[2].cost);
         assert_eq!(spliced[2].seq, below_four.path()[2].seq);
 
-        assert!(!Announcement::unchecked(spliced).verify::<Insecure>());
+        assert!(!Announcement::unchecked(spliced).verify::<StandIn>());
     }
 
     #[test]
@@ -528,13 +528,13 @@ mod tests {
         assert_eq!(child.author(), key(2));
         assert_eq!(child.root(), key(1));
         assert_eq!(child.cost_to_root(), 4);
-        assert!(child.verify::<Insecure>());
+        assert!(child.verify::<StandIn>());
 
         let grandchild = child
             .extend(&signer(3), cost(5), 0)
             .expect("distinct key attaches");
         assert_eq!(grandchild.cost_to_root(), 9, "costs add up the path");
-        assert!(grandchild.verify::<Insecure>());
+        assert!(grandchild.verify::<StandIn>());
     }
 
     #[test]
@@ -560,7 +560,7 @@ mod tests {
         assert!(after.same_position(&before), "the walk did not move");
         assert_eq!(walk(after.path()), walk(before.path()));
         assert!(
-            after.verify::<Insecure>(),
+            after.verify::<StandIn>(),
             "and it is signed for the new one"
         );
         assert!(after.supersedes(&before));

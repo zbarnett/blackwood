@@ -1,0 +1,9 @@
+[package]
+name = "routing-core"
+version = "0.1.0"
+edition = "2024"
+
+# None, and none intended. The one thing the core would otherwise have to reach
+# for — a signature scheme — arrives through the `Signer` trait instead, so a
+# caller brings the cryptography and this crate stays free of it.
+[dependencies]

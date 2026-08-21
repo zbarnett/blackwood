@@ -1,4 +1,4 @@
-//! A local viewer for a simulated [`blackwood`] network.
+//! A local viewer for a simulated [`routing_core`] network.
 //!
 //! The simulated network is entirely in memory: nodes hand each other messages
 //! as Rust values, exactly as they do in the core's tests. The only real socket

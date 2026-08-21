@@ -1,18 +1,17 @@
 //! A network whose nodes sign with real ed25519.
 //!
-//! The core's own simulation runs on [`Insecure`], where every key is legible
-//! and the root is whichever one reads smallest. This one runs on keys nobody
-//! chose, to show that the protocol never depended on that — and that a
+//! The core's own simulation runs on a stand-in signer, where every key is
+//! legible and the root is whichever one reads smallest. This one runs on keys
+//! nobody chose, to show that the protocol never depended on that — and that a
 //! position nobody signed for is refused rather than routed on.
-//!
-//! [`Insecure`]: blackwood::Insecure
 
 use std::collections::{BTreeMap, VecDeque};
 
-use blackwood::{
-    Announcement, Cost, Insecure, MalformedAnnouncement, Message, Node, Packet, PublicKey,
-};
 use blackwood_ed25519::Ed25519;
+use routing_core::{
+    Announcement, Cost, MalformedAnnouncement, Message, Node, Packet, PublicKey, SIGNATURE_LEN,
+    Signature, Signer,
+};
 
 /// A message in flight, from one node to a linked peer.
 struct InFlight {
@@ -60,7 +59,7 @@ impl Network {
         }
     }
 
-    fn enqueue(&mut self, from: PublicKey, outbound: Vec<blackwood::Envelope>) {
+    fn enqueue(&mut self, from: PublicKey, outbound: Vec<routing_core::Envelope>) {
         for envelope in outbound {
             self.queue.push_back(InFlight {
                 to: envelope.to,
@@ -206,14 +205,35 @@ fn a_position_nobody_signed_for_is_refused() {
     );
 }
 
+/// A signer that is not ed25519 and is not cryptography either: a signature
+/// under it is a fixed pattern anybody can write down.
+///
+/// It exists for the one test below, which needs a walk that is properly signed
+/// under *some* scheme and worthless under this network's.
+struct OtherScheme(PublicKey);
+
+impl Signer for OtherScheme {
+    fn public_key(&self) -> PublicKey {
+        self.0
+    }
+
+    fn sign(&self, _message: &[u8]) -> Signature {
+        Signature::new([0xa5; SIGNATURE_LEN])
+    }
+
+    fn verify(_key: PublicKey, _message: &[u8], signature: &Signature) -> bool {
+        signature.as_bytes() == &[0xa5; SIGNATURE_LEN]
+    }
+}
+
 #[test]
 fn a_walk_signed_under_another_scheme_does_not_check_out() {
-    // The stand-in signer will happily produce a walk, and every node in an
+    // The other scheme will happily produce a walk, and every node in an
     // ed25519 network will refuse it. Which algorithm is in use is not a
     // detail the protocol leaves open at runtime.
-    let pretender = Insecure::for_key(Ed25519::from_seed([1; 32]).key());
+    let pretender = OtherScheme(Ed25519::from_seed([1; 32]).key());
     let announcement = Announcement::root_of(&pretender, 0);
 
-    assert!(announcement.verify::<Insecure>());
+    assert!(announcement.verify::<OtherScheme>());
     assert!(!announcement.verify::<Ed25519>());
 }

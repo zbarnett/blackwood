@@ -8,8 +8,8 @@
 
 use std::collections::{BTreeMap, VecDeque};
 
-use blackwood::{Announcement, Cost, Envelope, Message, Node, PublicKey, Timing};
 use blackwood_ed25519::Ed25519;
+use routing_core::{Announcement, Cost, Envelope, Message, Node, PublicKey, Timing};
 
 /// A short label for a node, shown throughout the UI in place of its key.
 ///

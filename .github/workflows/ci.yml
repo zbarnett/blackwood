@@ -26,5 +26,6 @@ jobs:
       # step, 22-34s without it.
       - uses: dtolnay/rust-toolchain@stable
 
-      # --workspace so the viewer compiles here too; only the core has tests.
+      # --workspace so the viewer compiles here too, and so the ed25519 crate's
+      # own network tests run alongside the core's.
       - run: cargo test --locked --workspace

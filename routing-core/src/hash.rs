@@ -1,8 +1,9 @@
 //! A small non-cryptographic hash, used where only spread matters.
 //!
-//! Nothing here is a substitute for the cryptography a [`Signer`] supplies.
-//! Bloom filters need bits that scatter, and the stand-in signer needs bytes
-//! that change when its input does; neither needs to be hard to reverse.
+//! Nothing here is a substitute for the cryptography a [`Signer`] supplies, and
+//! nothing here is offered to a caller as one. Bloom filters need bits that
+//! scatter, and the stand-in signer the tests run on needs bytes that change
+//! when its input does; neither needs to be hard to reverse.
 //!
 //! [`Signer`]: crate::signature::Signer
 

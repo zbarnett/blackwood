@@ -689,14 +689,14 @@ impl<S: Signer> Node<S> {
 mod tests {
     use super::*;
     use crate::key::KEY_LEN;
-    use crate::signature::Insecure;
+    use crate::stand_in::StandIn;
 
     fn key(n: u8) -> PublicKey {
         PublicKey::new([n; KEY_LEN])
     }
 
-    fn signer(n: u8) -> Insecure {
-        Insecure::for_key(key(n))
+    fn signer(n: u8) -> StandIn {
+        StandIn::for_key(key(n))
     }
 
     fn cost(n: u64) -> Cost {
@@ -747,7 +747,7 @@ mod tests {
 
     /// A node linked to a peer holding a smaller key, having just heard where
     /// that peer sits, so it has taken up a position below it.
-    fn node_below_a_peer(now: u64) -> Node<Insecure> {
+    fn node_below_a_peer(now: u64) -> Node<StandIn> {
         let mut node = Node::new(0, signer(2));
         node.add_peer(0, key(1), Cost::UNIT);
         node.handle(now, key(1), announce(1, &[]));
@@ -756,7 +756,7 @@ mod tests {
 
     /// The middle of the line `1 - 2 - 3`: the root above, one child below,
     /// and the child claiming that 3 and 7 lie beyond it.
-    fn middle_of_a_line() -> Node<Insecure> {
+    fn middle_of_a_line() -> Node<StandIn> {
         let mut node = Node::new(0, signer(2));
         node.add_peer(0, key(1), Cost::UNIT);
         node.add_peer(0, key(3), Cost::UNIT);
@@ -785,7 +785,7 @@ mod tests {
     #[test]
     fn a_node_signs_where_it_says_it_sits() {
         let node = node_below_a_peer(0);
-        let announcement = Announcement::new::<Insecure>(node.path().to_vec());
+        let announcement = Announcement::new::<StandIn>(node.path().to_vec());
         assert!(
             announcement.is_ok(),
             "a node's own announcement must check out: {announcement:?}"
@@ -1158,7 +1158,7 @@ mod tests {
 
     /// A node holding key 5, linked to both 2 and 3 — each of them a child of
     /// the root — and told that 4 sits below 2, away from 3.
-    fn node_choosing_between_two_peers(to_two: u64, to_three: u64) -> Node<Insecure> {
+    fn node_choosing_between_two_peers(to_two: u64, to_three: u64) -> Node<StandIn> {
         let mut node = Node::new(0, signer(5));
         node.add_peer(0, key(2), cost(to_two));
         node.add_peer(0, key(3), cost(to_three));

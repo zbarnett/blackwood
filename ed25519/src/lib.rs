@@ -1,4 +1,4 @@
-//! ed25519 for [`blackwood`], kept outside it.
+//! ed25519 for [`routing_core`], kept outside it.
 //!
 //! The core says what has to be signed and what has to be checked, and takes
 //! the algorithm as a type parameter. This crate is one such algorithm. The
@@ -7,7 +7,7 @@
 //! code lives here, on this side of the boundary, and the core never sees it.
 //!
 //! ```
-//! use blackwood::{Cost, Node, Signer};
+//! use routing_core::{Cost, Node, Signer};
 //! use blackwood_ed25519::Ed25519;
 //!
 //! let alice = Ed25519::from_seed([1; 32]);
@@ -24,10 +24,10 @@
 
 use std::fmt;
 
-use blackwood::{PublicKey, Signature, Signer};
 use ed25519_dalek::{
     Signature as Ed25519Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey,
 };
+use routing_core::{PublicKey, Signature, Signer};
 
 /// The number of bytes in the seed an identity is built from.
 pub const SEED_LEN: usize = 32;
