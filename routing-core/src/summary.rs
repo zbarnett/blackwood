@@ -96,8 +96,12 @@ impl fmt::Debug for Summary {
 /// Which bit `key` sets on the given round.
 ///
 /// The mix after the hash is not decoration: the bit index is taken from the
-/// bottom of the word, and those are the bits FNV moves least, so without it
-/// keys that share a suffix would pile onto the same handful of positions.
+/// bottom of the word, and FNV stirs the bottom of a word least with the bytes
+/// that went into it last, so keys alike towards their end land on positions
+/// alike in the same narrow way. Keys made of one byte repeated, which is what
+/// this crate's tests are built from, are the worst of it — thirty-two of them
+/// set thirteen bits of a summary between them without the mix, and a hundred
+/// and four with it.
 fn position(key: PublicKey, round: usize) -> usize {
     let hash = mix(fnv1a(round as u8, key.as_bytes()));
     // `BITS` is a power of two, so this is a remainder and cannot exceed it.
@@ -152,6 +156,14 @@ mod tests {
     }
 
     #[test]
+    fn the_default_summary_is_the_empty_one() {
+        // Only here because a type with a `new` taking no arguments is
+        // expected to have it. Stated so that the two cannot drift apart and
+        // leave a caller with a filter that quietly claims something.
+        assert_eq!(Summary::default(), Summary::new());
+    }
+
+    #[test]
     fn what_was_inserted_is_never_missed() {
         let mut summary = Summary::new();
         for n in 0..32 {
@@ -170,7 +182,9 @@ mod tests {
         }
         // Thirty-two keys setting four bits each land on 128 positions out of
         // 256. Some collide; a hash that spread them badly would show up here
-        // as a summary far emptier than this bound allows.
+        // as a summary far emptier than this bound allows — which is exactly
+        // what these keys, each a single byte repeated, do without the mix
+        // that finishes `position`.
         assert!(
             summary.filled() > 80,
             "only {} bits set, so keys are colliding",

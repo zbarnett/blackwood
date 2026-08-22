@@ -805,6 +805,11 @@ mod tests {
         let mut node = Node::new(0, signer(2));
         assert!(node.handle(0, key(1), announce(1, &[])).is_empty());
         assert_eq!(node.root(), key(2), "the tree did not move");
+        assert_eq!(
+            node.known().count(),
+            0,
+            "nor was a position filed away for somebody there is no link to"
+        );
     }
 
     #[test]
@@ -823,6 +828,48 @@ mod tests {
 
         assert_eq!(node.root(), key(1), "the smaller key stays the root");
         assert_eq!(node.parent(), None);
+    }
+
+    #[test]
+    fn a_node_refuses_to_sit_below_a_walk_that_runs_through_it() {
+        // 3 still believes it sits below this node, and by way of a root this
+        // node would much rather answer to than itself. Taking the offer would
+        // make the two of them each other's parent, and the cycle would stand
+        // until something outside it happened to break. Because an
+        // announcement carries the whole walk, the question is settled here
+        // and now, out of what this node can see on its own.
+        let mut node = Node::new(0, signer(2));
+        node.add_peer(0, key(3), Cost::UNIT);
+        node.handle(0, key(3), announce(1, &[(2, 1), (3, 1)]));
+
+        assert_eq!(node.root(), key(2), "a tree of one beats a cycle of two");
+        assert_eq!(node.parent(), None);
+        assert!(
+            node.known().any(|known| known == key(3)),
+            "the offer was refused, not the node that made it"
+        );
+    }
+
+    #[test]
+    fn a_node_will_not_be_told_where_it_sits() {
+        // A search answered with this node's own position, arriving back at
+        // it: an echo of something it said, or somebody else's idea of where
+        // it belongs. A node is the only authority on that, so either way
+        // there is nothing here to learn.
+        let mut node = node_below_a_peer(0);
+        let before = node.path().to_vec();
+
+        node.handle(
+            1,
+            key(1),
+            Message::Found(Found {
+                announcement: announcement(1, &[(9, 1), (2, 1)]),
+                trail: vec![key(2)],
+            }),
+        );
+
+        assert_eq!(node.path(), before, "still where it put itself");
+        assert!(!node.known().any(|known| known == key(2)));
     }
 
     #[test]
@@ -935,6 +982,124 @@ mod tests {
                     payload: b"up".to_vec(),
                 },
             })
+        );
+    }
+
+    #[test]
+    fn a_packet_passing_through_is_handed_on_exactly_as_it_arrived() {
+        // The coordinates it is travelling by are the sender's and stay the
+        // sender's. A node in the middle re-addresses nothing: it picks the
+        // next hop and passes the packet along untouched, which is what has
+        // every node on the route measuring against the same target.
+        let mut node = middle_of_a_line();
+        let traffic = Traffic {
+            dst_path: path(1, &[(2, 1), (3, 1)]),
+            packet: Packet {
+                src: key(1),
+                dst: key(3),
+                payload: b"onwards".to_vec(),
+            },
+        };
+
+        let out = node.handle(0, key(1), Message::Traffic(traffic.clone()));
+
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].to, key(3));
+        assert_eq!(out[0].message, Message::Traffic(traffic));
+        assert!(
+            node.take_delivered().is_empty(),
+            "carrying a packet is not being addressed by it"
+        );
+    }
+
+    #[test]
+    fn a_packet_that_has_arrived_is_delivered_rather_than_forwarded() {
+        let mut node = middle_of_a_line();
+        let packet = Packet {
+            src: key(1),
+            dst: key(2),
+            payload: b"for you".to_vec(),
+        };
+
+        let out = node.handle(
+            0,
+            key(1),
+            Message::Traffic(Traffic {
+                dst_path: path(1, &[(2, 1)]),
+                packet: packet.clone(),
+            }),
+        );
+
+        assert!(out.is_empty(), "it goes no further");
+        assert_eq!(node.take_delivered(), vec![packet]);
+    }
+
+    #[test]
+    fn a_packet_at_a_dead_end_is_dropped() {
+        // 3 has gone and nothing has expired yet, so a packet for it still
+        // arrives here addressed to a position nothing leads to any more. No
+        // peer stands closer than this node does. Ironwood would report the
+        // broken path back through the tree; this core does the same minus
+        // the recovery, which is to stop.
+        let mut node = middle_of_a_line();
+        node.remove_peer(0, key(3));
+
+        let out = node.handle(
+            0,
+            key(1),
+            Message::Traffic(Traffic {
+                dst_path: path(1, &[(2, 1), (3, 1)]),
+                packet: Packet {
+                    src: key(1),
+                    dst: key(3),
+                    payload: b"nobody home".to_vec(),
+                },
+            }),
+        );
+
+        assert!(out.is_empty(), "dropped, rather than handed backwards");
+        assert!(
+            node.take_delivered().is_empty(),
+            "and not delivered to the wrong node either"
+        );
+    }
+
+    #[test]
+    fn a_peer_exactly_as_far_away_is_not_progress() {
+        // 3 has not caught up: it still announces itself below this node,
+        // which has since gone off on its own. Measured against 4's
+        // coordinates, the two of them are the same distance away — and being
+        // no worse is not the test. Handing the packet over on equal terms is
+        // how it comes straight back, and it is only strictness that keeps
+        // the distance falling at every hop.
+        let mut node = Node::new(0, signer(2));
+        node.add_peer(0, key(3), Cost::UNIT);
+        node.handle(0, key(3), announce(1, &[(2, 1), (3, 1)]));
+        node.handle(0, key(3), found(2, 1, &[(2, 1), (4, 1)]));
+
+        assert_eq!(node.root(), key(2), "this node sits outside that walk now");
+        assert_eq!(
+            distance(node.path(), &path(1, &[(2, 1), (4, 1)])),
+            distance(&path(1, &[(2, 1), (3, 1)]), &path(1, &[(2, 1), (4, 1)])),
+            "a dead heat, which is the case the rule is strict about"
+        );
+        assert_eq!(node.send(key(4), b"hi".to_vec()), Err(SendError::NoRoute));
+    }
+
+    #[test]
+    fn a_packet_with_nowhere_closer_to_go_is_refused_at_the_source() {
+        // 4 sat below this node until its link went down, and its position is
+        // still held. Every peer this node has is further from 4 than it is
+        // itself, so there is no hop that makes progress. Saying so beats
+        // posting the packet to a peer that would only drop it.
+        let mut node = node_below_a_peer(0);
+        node.handle(0, key(1), found(2, 1, &[(2, 1), (4, 1)]));
+        assert!(node.known().any(|known| known == key(4)));
+
+        assert_eq!(
+            node.send(key(4), b"hi".to_vec()),
+            Err(SendError::NoRoute),
+            "the position is known and unreachable, which is not the same as unknown"
         );
     }
 
@@ -1121,6 +1286,40 @@ mod tests {
     }
 
     #[test]
+    fn losing_a_parent_re_roots_a_node_and_tells_the_peers_it_has_left() {
+        let mut node = middle_of_a_line();
+        assert_eq!(node.parent(), Some(key(1)));
+
+        let out = node.remove_peer(0, key(1));
+
+        assert_eq!(
+            node.root(),
+            key(2),
+            "with the link went the way to the root"
+        );
+        assert_eq!(node.parent(), None);
+        assert_eq!(
+            announces(&out),
+            vec![key(3)],
+            "the peer still there is told at once, rather than waiting to notice"
+        );
+        assert!(
+            node.known().any(|known| known == key(1)),
+            "nothing is withdrawn here, since a node cannot tell what was only reachable that way"
+        );
+    }
+
+    #[test]
+    fn removing_a_link_that_was_never_up_changes_nothing() {
+        let mut node = node_below_a_peer(0);
+        let before = node.path().to_vec();
+
+        assert!(node.remove_peer(1, key(8)).is_empty());
+        assert_eq!(node.path(), before);
+        assert_eq!(node.peers().count(), 1);
+    }
+
+    #[test]
     fn a_node_stays_put_when_the_walk_above_it_is_merely_restamped() {
         let mut node = node_below_a_peer(0);
         let before = node.path().to_vec();
@@ -1222,6 +1421,36 @@ mod tests {
     }
 
     #[test]
+    fn a_summary_that_says_nothing_new_ends_where_it_arrives() {
+        // This is what brings the exchange to rest. Every summary that lands
+        // has a node working out afresh what to tell everybody else, so one
+        // that repeats what its link already said has to stop here — and one
+        // that does carry news has to travel, or the far side of the tree
+        // never hears of the key that turned up.
+        let mut node = middle_of_a_line();
+
+        assert!(
+            node.handle(0, key(3), Message::Summary(summary_of(&[3, 7])))
+                .is_empty(),
+            "3 has said this once already"
+        );
+
+        let out = node.handle(0, key(3), Message::Summary(summary_of(&[3, 7, 9])));
+
+        assert_eq!(
+            out.len(),
+            1,
+            "upwards, and not back to the peer it came from"
+        );
+        assert_eq!(out[0].to, key(1));
+        assert!(
+            node.summary_for(key(1))
+                .expect("the parent is a tree link")
+                .contains(key(9))
+        );
+    }
+
+    #[test]
     fn a_search_goes_only_where_a_summary_admits_it_might_be() {
         let node = middle_of_a_line();
 
@@ -1267,6 +1496,60 @@ mod tests {
                 trail: vec![key(1), key(2)],
             })
         );
+    }
+
+    #[test]
+    fn a_link_that_has_left_the_tree_stops_carrying_searches() {
+        // What a peer last claimed lies beyond it stays on file — there is
+        // nothing to replace it with until the peer says otherwise. But 3 has
+        // moved out from under this node, and a summary is a claim about a
+        // tree link and worthless off one: folded around the cycle that link
+        // now closes, it would hand every key back to where it came from.
+        let mut node = middle_of_a_line();
+        assert_eq!(node.lookup(key(7)).len(), 1, "while 3 was still below");
+
+        node.handle(
+            0,
+            key(3),
+            Message::Announce(
+                announcement(1, &[(6, 1), (3, 1)])
+                    .with_seq(&signer(3), 1)
+                    .expect("the author"),
+            ),
+        );
+
+        assert_eq!(
+            node.summary_for(key(3)),
+            None,
+            "nothing goes down it either"
+        );
+        assert!(
+            node.lookup(key(7)).is_empty(),
+            "3 still claims 7, and is no longer anybody this node may ask"
+        );
+    }
+
+    #[test]
+    fn a_search_is_never_handed_back_to_a_node_it_has_already_been_to() {
+        // 1's summary admits 7 as readily as 3's does — of course it does,
+        // since 7 is not on this node's side of that link either. Handing the
+        // search straight back the way it came would still terminate, because
+        // 1 would find itself on the trail and refuse it, but the message
+        // exists only to be thrown away.
+        let mut node = middle_of_a_line();
+        node.handle(0, key(1), Message::Summary(summary_of(&[7])));
+
+        let out = node.handle(
+            0,
+            key(1),
+            Message::Lookup(Lookup {
+                target: key(7),
+                trail: vec![key(1)],
+            }),
+        );
+
+        assert_eq!(out.len(), 1, "onwards only");
+        assert_eq!(out[0].to, key(3));
     }
 
     #[test]

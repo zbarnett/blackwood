@@ -473,6 +473,42 @@ mod tests {
     }
 
     #[test]
+    fn rejects_a_walk_altered_above_the_node_that_would_gain_by_it() {
+        // The lie worth telling is not about one's own hop. 3 rubs out the
+        // price of the link into 2, above it, so that the whole walk down to
+        // it looks cheap and traffic for anything below comes its way — and
+        // then signs its own hop over the altered walk, perfectly properly,
+        // because that hop is the one thing here it is entitled to sign.
+        //
+        // Every hop below an alteration can be re-made like this by whoever
+        // holds the key it names. What cannot be re-made is the signature on
+        // the altered hop itself, which is why the check is per hop and not
+        // merely a matter of following the chain down from the bottom.
+        let mut above = path(1, &[(2, 9)]);
+        above[1].cost = 1;
+        let forged = Announcement::unchecked(above)
+            .extend(&signer(3), Cost::UNIT, 0)
+            .expect("distinct key attaches");
+
+        assert!(
+            StandIn::verify(
+                forged.path()[2].key,
+                &signed_bytes(&forged.path()[..2], key(3), 1, 0),
+                &forged.path()[2].signature,
+            ),
+            "3's own hop is beyond reproach"
+        );
+        assert!(
+            !forged.verify::<StandIn>(),
+            "and 2's, which it rewrote, is not"
+        );
+        assert_eq!(
+            Announcement::new::<StandIn>(forged.path().to_vec()),
+            Err(MalformedAnnouncement::BadSignature)
+        );
+    }
+
+    #[test]
     fn every_hop_is_signed_by_the_node_it_names() {
         let announcement = announcement(1, &[(2, 1), (3, 1)]);
         assert!(announcement.verify::<StandIn>());
@@ -584,12 +620,45 @@ mod tests {
     }
 
     #[test]
+    fn a_re_priced_walk_is_a_different_position() {
+        // The same nodes in the same order, over a link measured again and
+        // found worse. Nothing about the shape of the walk moved, but what it
+        // costs to follow did, and a node that called this standing still
+        // would keep the new price to itself and leave everyone below it
+        // working from the old one.
+        let before = announcement(1, &[(2, 1)]);
+        let after = announcement(1, &[(2, 5)]);
+
+        let keys = |a: &Announcement| a.path().iter().map(|hop| hop.key).collect::<Vec<_>>();
+        assert_eq!(keys(&before), keys(&after), "nobody moved");
+        assert!(!before.same_position(&after));
+    }
+
+    #[test]
     fn later_sequence_numbers_supersede() {
         let old = Announcement::root_of(&signer(1), 4);
         let new = Announcement::root_of(&signer(1), 5);
         assert!(new.supersedes(&old));
         assert!(!old.supersedes(&new));
         assert!(!new.supersedes(&new));
+    }
+
+    #[test]
+    fn a_tie_on_sequence_numbers_is_broken_by_the_walk() {
+        // One author, one sequence number, two different walks: a node that
+        // moved without restamping, or two copies of one that crossed. The
+        // rule has to answer anyway and answer the same way everywhere, or
+        // two nodes holding both would keep different ones and disagree
+        // about where their common neighbour sits.
+        let through_two = announcement(1, &[(2, 1), (5, 1)]);
+        let through_three = announcement(1, &[(3, 1), (5, 1)]);
+        assert_eq!(through_two.seq(), through_three.seq());
+
+        assert!(through_three.supersedes(&through_two));
+        assert!(
+            !through_two.supersedes(&through_three),
+            "and not the reverse"
+        );
     }
 
     #[test]
@@ -623,6 +692,24 @@ mod tests {
         let one_hop = announcement(1, &[(5, 2)]);
         assert_eq!(two_hops.cost_to_root(), one_hop.cost_to_root());
         assert_eq!(one_hop.preference_cmp(&two_hops), Ordering::Less);
+    }
+
+    #[test]
+    fn preference_breaks_a_dead_heat_on_the_walk_itself() {
+        // Same root, same price, same number of hops, and still one of them
+        // has to win. What it settles on matters less than that every node
+        // settles on it: this is the last tie-break, and without it the tree
+        // would have no single fixed point to come to rest at.
+        let through_three = announcement(1, &[(3, 1), (5, 1)]);
+        let through_four = announcement(1, &[(4, 1), (5, 1)]);
+        assert_eq!(through_three.cost_to_root(), through_four.cost_to_root());
+        assert_eq!(through_three.path().len(), through_four.path().len());
+
+        assert_eq!(through_three.preference_cmp(&through_four), Ordering::Less);
+        assert_eq!(
+            through_four.preference_cmp(&through_three),
+            Ordering::Greater
+        );
     }
 
     #[test]
@@ -667,17 +754,68 @@ mod tests {
     }
 
     #[test]
+    fn two_walks_that_disagree_about_the_root_share_no_prefix() {
+        // Nothing is comparable across two trees, and what comes out is only
+        // what each walk pays to reach its own root. The number is well
+        // defined and means nothing, which is exactly the transient state
+        // forwarding survives by demanding strict progress: offered a figure
+        // like this one, a node drops the packet rather than trusting it.
+        let mine = path(1, &[(2, 3)]);
+        let theirs = path(4, &[(5, 7)]);
+
+        assert_eq!(distance(&mine, &theirs), 3 + 7);
+    }
+
+    #[test]
+    fn a_walk_priced_past_the_ceiling_saturates_rather_than_wrapping() {
+        // Out of reach of any caller counting anything real, and it still has
+        // to be the right kind of wrong: a route that looks infinitely
+        // expensive is merely never chosen, where one that wrapped back round
+        // to nothing would look like the best in the network. Nor may the
+        // arithmetic be what decides it — a node does not panic.
+        let mut mine = path(1, &[(2, 1), (4, 1)]);
+        mine[1].cost = u64::MAX;
+        mine[2].cost = u64::MAX;
+        let mut theirs = path(1, &[(3, 1)]);
+        theirs[1].cost = u64::MAX;
+
+        assert_eq!(
+            Announcement::unchecked(mine.clone()).cost_to_root(),
+            u64::MAX,
+            "two links of it are not cheaper than one"
+        );
+        assert_eq!(
+            distance(&mine, &theirs),
+            u64::MAX,
+            "nor is the walk between two of them"
+        );
+    }
+
+    #[test]
     fn distance_ignores_how_a_shared_prefix_was_stamped() {
         // Two nodes holding differently stamped copies of the same walk must
         // agree on where it forks, or a packet would appear to make progress
-        // it had not made.
+        // it had not made. The stamp that has to be overlooked is one *inside*
+        // the shared part: 2 reissued, and only one of these two walks was
+        // built after it did.
         let mine = announcement(1, &[(2, 1), (3, 1)]);
-        let theirs = announcement(1, &[(2, 1), (4, 1)]);
-        let restamped = theirs.with_seq(&signer(4), 300).expect("the author");
+        let reissued = announcement(1, &[(2, 1)])
+            .with_seq(&signer(2), 300)
+            .expect("the author may restamp");
+        let theirs = reissued
+            .extend(&signer(4), Cost::UNIT, 0)
+            .expect("distinct key attaches");
 
+        assert_ne!(
+            mine.path()[1],
+            theirs.path()[1],
+            "the same hop, stamped twice"
+        );
+        assert_eq!(mine.path()[1].key, theirs.path()[1].key);
         assert_eq!(
             distance(mine.path(), theirs.path()),
-            distance(mine.path(), restamped.path())
+            2,
+            "they still fork below 2, not at it"
         );
     }
 }
