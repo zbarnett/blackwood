@@ -2,7 +2,6 @@
 
 use std::fmt;
 
-use crate::hash::{fnv1a, mix};
 use crate::key::PublicKey;
 
 /// The set of keys reachable through one link, as a Bloom filter.
@@ -21,7 +20,7 @@ use crate::key::PublicKey;
 /// and twenty-eight. Ironwood uses a filter thirty-two times this size;
 /// [`BITS`](Summary::BITS) is the only thing standing between this and a
 /// network of that size.
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Summary {
     words: [u64; Summary::BITS / 64],
 }
@@ -77,10 +76,14 @@ impl Summary {
     pub fn filled(&self) -> u32 {
         self.words.iter().map(|word| word.count_ones()).sum()
     }
+}
 
-    /// Whether this summary claims nothing at all.
-    pub fn is_empty(&self) -> bool {
-        self.words.iter().all(|word| *word == 0)
+impl Default for Summary {
+    /// The same empty summary [`new`](Summary::new) builds, so that the two
+    /// cannot drift apart. It is here because a type with a `new` taking no
+    /// arguments is expected to have it, not because anything needs it.
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -96,9 +99,40 @@ impl fmt::Debug for Summary {
 /// bottom of the word, and those are the bits FNV moves least, so without it
 /// keys that share a suffix would pile onto the same handful of positions.
 fn position(key: PublicKey, round: usize) -> usize {
-    let hash = mix(fnv1a(round as u8, key.as_bytes().iter().copied()));
+    let hash = mix(fnv1a(round as u8, key.as_bytes()));
     // `BITS` is a power of two, so this is a remainder and cannot exceed it.
     (hash as usize) & (Summary::BITS - 1)
+}
+
+/// FNV-1a over `bytes`, salted with `round` so one key can yield several
+/// independent positions.
+///
+/// Not a substitute for the cryptography a [`Signer`] supplies, and not offered
+/// to a caller as one: a Bloom filter needs bits that scatter, which is the
+/// whole of what this has to do.
+///
+/// [`Signer`]: crate::signature::Signer
+fn fnv1a(round: u8, bytes: &[u8]) -> u64 {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = OFFSET;
+    for byte in std::iter::once(round).chain(bytes.iter().copied()) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(PRIME);
+    }
+    hash
+}
+
+/// The mix that finishes a murmur hash, for when only some of the bits of a
+/// hash are going to be read.
+///
+/// FNV moves its low bits least, so taking a small index from the bottom of the
+/// word wants this first.
+fn mix(mut hash: u64) -> u64 {
+    hash ^= hash >> 33;
+    hash = hash.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    hash ^ (hash >> 33)
 }
 
 #[cfg(test)]
@@ -113,7 +147,6 @@ mod tests {
     #[test]
     fn an_empty_summary_claims_nothing() {
         let summary = Summary::new();
-        assert!(summary.is_empty());
         assert_eq!(summary.filled(), 0);
         assert!(!summary.contains(key(1)));
     }

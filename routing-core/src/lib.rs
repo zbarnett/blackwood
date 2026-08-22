@@ -204,7 +204,6 @@
 #![forbid(unsafe_code)]
 #![deny(missing_docs)]
 
-mod hash;
 pub mod key;
 pub mod message;
 pub mod node;

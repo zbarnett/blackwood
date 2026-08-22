@@ -66,12 +66,6 @@ impl Timing {
     };
 }
 
-impl Default for Timing {
-    fn default() -> Self {
-        Self::DEFAULT
-    }
-}
-
 /// An announcement about another node, and when this node last heard it.
 ///
 /// The instant is local: it records when the announcement *arrived here*, not
@@ -164,11 +158,6 @@ impl<S: Signer> Node<S> {
     /// This node's address.
     pub fn key(&self) -> PublicKey {
         self.key
-    }
-
-    /// The schedule this node keeps state on.
-    pub fn timing(&self) -> Timing {
-        self.timing
     }
 
     /// The root of the spanning tree this node currently believes in.

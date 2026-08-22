@@ -11,7 +11,6 @@
 //! for its own tests. There is no build of this library in which a caller could
 //! reach for it instead of bringing cryptography of their own.
 
-use crate::hash::fnv1a;
 use crate::key::PublicKey;
 use crate::signature::{SIGNATURE_LEN, Signature, Signer};
 
@@ -46,11 +45,21 @@ impl Signer for StandIn {
     }
 }
 
-/// A hash of key and message, run enough times to fill a signature.
+/// FNV-1a over the key and the message, salted per eight-byte chunk so that one
+/// input fills a whole signature.
+///
+/// Written out here rather than shared with the one the summaries use, so that
+/// nothing a real build compiles exists for this type's sake.
 fn stamp(key: PublicKey, message: &[u8]) -> Signature {
     let mut bytes = [0; SIGNATURE_LEN];
     for (round, chunk) in bytes.chunks_mut(8).enumerate() {
-        let hash = fnv1a(round as u8, key.as_bytes().iter().chain(message).copied());
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for byte in std::iter::once(round as u8)
+            .chain(key.as_bytes().iter().copied())
+            .chain(message.iter().copied())
+        {
+            hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
         // Every chunk of a 64-byte array split eight ways is eight bytes long.
         chunk.copy_from_slice(&hash.to_be_bytes());
     }

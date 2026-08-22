@@ -38,12 +38,6 @@ impl Cost {
     }
 }
 
-impl Default for Cost {
-    fn default() -> Self {
-        Self::UNIT
-    }
-}
-
 impl fmt::Display for Cost {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
