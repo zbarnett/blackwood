@@ -197,16 +197,18 @@ impl Sim {
         }
 
         // These cannot fail: the links are between distinct nodes that were
-        // just created, and no cost is zero.
-        // The 2-4 link is the short way round and the dear one, so the tree
-        // that forms is the cheapest one rather than the shallowest. 6 hangs
-        // off 2 on a branch of its own, which is what gives a search somewhere
-        // it can decline to go.
+        // just created.
+        // 2 and 3 both sit one link below the root, so 4's choice between them
+        // is not one the rest of the network can settle — what settles it is
+        // that 4 measures its own link to 3 at a fifth of its link to 2. The
+        // 2-4 link is left out of the tree, which is what gives the picture a
+        // cycle; 6 hangs off 2 on a branch of its own, which is what gives a
+        // search somewhere it can decline to go.
         for (a, b, cost) in [
             (1, 2, 1),
-            (2, 3, 1),
-            (3, 4, 1),
+            (1, 3, 1),
             (2, 4, 5),
+            (3, 4, 1),
             (4, 5, 1),
             (2, 6, 1),
         ] {
@@ -260,7 +262,7 @@ impl Sim {
         }
         self.require(a)?;
         self.require(b)?;
-        let cost = price(cost)?;
+        let cost = Cost::new(cost);
         if self.links.contains_key(&ordered(a, b)) {
             return Err(format!("{a} and {b} are already linked"));
         }
@@ -272,10 +274,12 @@ impl Sim {
     /// Re-prices a link that is already up.
     ///
     /// This is what a real caller does when it measures a peering again, and
-    /// it is the whole of what link cost changes: no message crosses the
-    /// network, but every node that was routing over this link reconsiders.
+    /// it is the whole of what a price does: nothing is announced, because a
+    /// price is each node's own measurement of its own link and nobody else
+    /// ever hears it. What can follow is a node changing its mind about which
+    /// of two equally good peers to sit below — and *that* it announces.
     pub fn set_link_cost(&mut self, a: Id, b: Id, cost: u64) -> Result<(), String> {
-        let cost = price(cost)?;
+        let cost = Cost::new(cost);
         let Some(&current) = self.links.get(&ordered(a, b)) else {
             return Err(format!("{a} and {b} are not linked"));
         };
@@ -373,12 +377,11 @@ impl Sim {
     ///
     /// The second is the splice, and it is the one worth money. A stranger
     /// takes this node's walk — any answer to a search hands one out — and
-    /// signs herself onto the end of it over a link costing one. Every
-    /// signature above her is genuine and her own hop is hers to sign, so
-    /// before positions were bargains this was the cheapest way to claim the
-    /// shortest walk to the root in the neighbourhood, collect whatever peers
-    /// believed it, and leave every one of them unreachable. What she cannot
-    /// produce is the other half: this node's agreement to carry her.
+    /// signs herself onto the end of it. Every signature above her is genuine
+    /// and her own hop is hers to sign, so before positions were bargains this
+    /// was the cheapest way to claim a place near the root, collect whatever
+    /// peers believed it, and leave every one of them unreachable. What she
+    /// cannot produce is the other half: this node's agreement to carry her.
     ///
     /// Nothing is injected into the running network. `Announcement::new` and
     /// `Announcement::extend` are the doors everything arriving from a link
@@ -399,11 +402,10 @@ impl Sim {
         // A key belonging to nobody in the network, which is the point: she
         // needs no standing anywhere to try this.
         let intruder = Ed25519::from_seed([0xff; 32]);
-        let cheap = Cost::new(1).expect("one is not zero");
         let splice_refused = Announcement::new::<Ed25519>(self.node(id)?.path().to_vec())
             .ok()
             .and_then(|walk| {
-                walk.extend(&intruder, &Consent::issue(&intruder, intruder.key(), cheap), 1)
+                walk.extend(&intruder, &Consent::issue(&intruder, intruder.key()), 1)
             })
             .is_none()
             .then(|| format!("{id} never agreed to carry her"));
@@ -487,7 +489,7 @@ impl Sim {
             .iter()
             .map(|(id, node)| {
                 format!(
-                    r#"{{"id":{id},"key":{},"root":{},"parent":{},"path":{},"cost":{},"peers":{},"knows":{}}}"#,
+                    r#"{{"id":{id},"key":{},"root":{},"parent":{},"path":{},"depth":{},"peers":{},"knows":{}}}"#,
                     json_string(&short_key(node.key())),
                     self.id_of(node.root()),
                     match node.parent() {
@@ -495,7 +497,7 @@ impl Sim {
                         None => "null".into(),
                     },
                     json_ids(node.path().iter().map(|hop| self.id_of(hop.key))),
-                    node.cost_to_root(),
+                    node.depth(),
                     json_ids(node.peers().map(|(peer, _)| self.id_of(peer))),
                     node.known().count(),
                 )
@@ -686,11 +688,6 @@ impl Sim {
         self.version += 1;
         self.log.push(line.to_string());
     }
-}
-
-/// Reads a cost off the wire, where a link that costs nothing is not a link.
-fn price(cost: u64) -> Result<Cost, String> {
-    Cost::new(cost).ok_or_else(|| "a link costs at least 1".to_string())
 }
 
 fn ordered(a: Id, b: Id) -> (Id, Id) {

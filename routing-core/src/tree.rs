@@ -1,78 +1,28 @@
 //! The spanning tree: what nodes announce, and the metric derived from it.
 
-use std::cmp::Ordering;
 use std::fmt;
 
 use crate::key::PublicKey;
 use crate::signature::{SIGNATURE_LEN, Signature, Signer};
 
-/// What crossing one link costs.
-///
-/// Ironwood measures a peering's latency; here the number is whatever the
-/// caller says it is, counted in whatever unit it likes. Only the ordering
-/// matters, and only among the links of one network.
-///
-/// A cost is at least one, which is what keeps both of the protocol's
-/// guarantees standing: a packet makes strict progress at every hop, and a
-/// node's parent is strictly nearer the root than the node itself. A network
-/// whose links all cost [`Cost::UNIT`] measures distance in hops, which is
-/// what this core did before costs existed.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct Cost(u64);
-
-impl Cost {
-    /// The cost of a link counted as a single hop.
-    pub const UNIT: Self = Self(1);
-
-    /// Wraps a measurement, rejecting the zero a free link would claim to be.
-    pub const fn new(value: u64) -> Option<Self> {
-        match value {
-            0 => None,
-            value => Some(Self(value)),
-        }
-    }
-
-    /// The measurement itself.
-    pub const fn get(self) -> u64 {
-        self.0
-    }
-}
-
-impl fmt::Display for Cost {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
-/// One step down the tree: a node, what reaching it cost, and its own hand on
-/// the whole walk down to it.
+/// One step down the tree: a node, and its own hand on the whole walk down
+/// to it.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Hop {
     /// The node this step arrives at.
     pub key: PublicKey,
-    /// What the link from the previous hop to this one costs to cross, as
-    /// priced by the previous hop.
-    ///
-    /// The node above sets it because it is the one that has to carry the
-    /// traffic, and it is part of what that node signed in [`Hop::consent`] —
-    /// so a node cannot announce a cheaper link than the one it was offered.
-    ///
-    /// Zero at the root, which nothing precedes, and at least one at every
-    /// other hop. [`Announcement`] guarantees both, so summing the costs of a
-    /// path's tail is always the cost of a real walk.
-    pub cost: u64,
     /// The sequence number this hop's node stamped it with.
     ///
     /// Every hop carries its own, because every hop was signed separately by
     /// the node that added it, and the number is part of what it signed.
     pub seq: u64,
-    /// The hop above's agreement that this node may sit below it at this price.
+    /// The hop above's agreement that this node may sit below it.
     ///
     /// `None` at the root, which nothing precedes, and `Some` at every other
     /// hop: the signature of the node named in the hop above, over this node's
-    /// key and the cost of the link between them. It is what makes a position
-    /// a bargain struck by both ends rather than a claim made by one, and so
-    /// what stops a node signing itself onto a walk it has no link to.
+    /// key. It is what makes a position a bargain struck by both ends rather
+    /// than a claim made by one, and so what stops a node signing itself onto
+    /// a walk it has no link to.
     ///
     /// [`Announcement`] guarantees the shape, so a hop below the root always
     /// carries one and the root never does.
@@ -89,14 +39,14 @@ pub struct Hop {
 ///
 /// A position in the tree is the only thing a node says that is really about
 /// two nodes rather than one, and this is the other end's half of it. The
-/// parent signs the child's key together with the price it puts on the link
-/// between them; the child carries that signature in its own hop, where
-/// anybody reading its walk down the tree can check it.
+/// parent signs the child's key; the child carries that signature in its own
+/// hop, where anybody reading its walk down the tree can check it.
 ///
-/// The cost travels here rather than in the child's announcement because the
-/// parent is the end that has to agree to carry the traffic. A child that
-/// understated what its link cost would otherwise be advertising a bargain
-/// nobody had offered it.
+/// What a consent does not carry is a price. What a link costs is measured by
+/// each end for itself and spent on that end's own decisions — see
+/// [`Cost`](crate::Cost) — so there is nothing here for the two of them to
+/// agree about beyond the link's existence, and nothing a reader of the walk
+/// has to take on the word of a node whose links it will never cross.
 ///
 /// A value of this type has always been checked. It is either one this node
 /// signed itself, through [`issue`](Self::issue), or one that verified when it
@@ -106,20 +56,17 @@ pub struct Hop {
 pub struct Consent {
     parent: PublicKey,
     child: PublicKey,
-    cost: Cost,
     signature: Signature,
 }
 
 impl Consent {
-    /// The consent `signer`'s node gives `child` to sit below it, over a link
-    /// the signer prices at `cost`.
-    pub fn issue<S: Signer>(signer: &S, child: PublicKey, cost: Cost) -> Self {
+    /// The consent `signer`'s node gives `child` to sit below it.
+    pub fn issue<S: Signer>(signer: &S, child: PublicKey) -> Self {
         let parent = signer.public_key();
         Self {
             parent,
             child,
-            cost,
-            signature: signer.sign(&consent_bytes(parent, child, cost.get())),
+            signature: signer.sign(&consent_bytes(parent, child)),
         }
     }
 
@@ -130,13 +77,11 @@ impl Consent {
     pub fn new<S: Signer>(
         parent: PublicKey,
         child: PublicKey,
-        cost: Cost,
         signature: Signature,
     ) -> Option<Self> {
-        S::verify(parent, &consent_bytes(parent, child, cost.get()), &signature).then_some(Self {
+        S::verify(parent, &consent_bytes(parent, child), &signature).then_some(Self {
             parent,
             child,
-            cost,
             signature,
         })
     }
@@ -151,11 +96,6 @@ impl Consent {
         self.child
     }
 
-    /// What the parent says the link between them costs.
-    pub fn cost(&self) -> Cost {
-        self.cost
-    }
-
     /// The parent's signature, as it travels in the child's hop.
     pub fn signature(&self) -> Signature {
         self.signature
@@ -166,17 +106,21 @@ impl Consent {
 ///
 /// The path runs from the root down to the announcing node, inclusive, so
 /// `path[0]` is the root and the last element is the author. Each hop carries
-/// the cost of the link that reaches it, as priced by the node above — the one
-/// that agreed to carry it — along with that node's consent and its own
-/// signature. Carrying the whole path rather than just a parent pointer is
-/// what makes routing decisions local: a node can compute its distance to any
-/// other node it has heard of without consulting anyone.
+/// the consent of the node above it — the one that agreed to carry it — along
+/// with its own signature. Carrying the whole path rather than just a parent
+/// pointer is what makes routing decisions local: a node can compute its
+/// distance to any other node it has heard of without consulting anyone.
+///
+/// What it does not carry is what any of those links cost. A walk names nodes
+/// and nothing else, so the only number a reader takes from it is how many
+/// links it holds — which every reader takes identically, from bytes that were
+/// all signed by somebody.
 ///
 /// Every constructor guarantees the path is non-empty, free of repeated keys,
-/// priced as [`Hop::cost`] describes, signed at every hop by the node that hop
-/// names, and consented to at every hop by the node above it. A value of this type is therefore always well formed, but it is
-/// only as *current* as whoever handed it over: see [`verify`](Self::verify)
-/// for what a signature does and does not settle.
+/// signed at every hop by the node that hop names, and consented to at every
+/// hop by the node above it. A value of this type is therefore always well
+/// formed, but it is only as *current* as whoever handed it over: see
+/// [`verify`](Self::verify) for what a signature does and does not settle.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Announcement {
     path: Vec<Hop>,
@@ -189,10 +133,6 @@ pub enum MalformedAnnouncement {
     EmptyPath,
     /// A key appeared twice, which would describe a loop rather than a path.
     RepeatedKey,
-    /// The root hop carried a cost, though no link reaches the root.
-    CostAtRoot,
-    /// A link below the root cost nothing, so crossing it would be no progress.
-    FreeLink,
     /// Some hop was not signed by the node it names.
     BadSignature,
     /// The root hop carried a consent, though no node sits above the root to
@@ -202,7 +142,7 @@ pub enum MalformedAnnouncement {
     /// agreed to.
     MissingConsent,
     /// Some hop's consent was not signed by the node in the hop above it, or
-    /// was given to another node or at another price.
+    /// was given to another node.
     BadConsent,
 }
 
@@ -211,8 +151,6 @@ impl fmt::Display for MalformedAnnouncement {
         match self {
             Self::EmptyPath => f.write_str("announcement path is empty"),
             Self::RepeatedKey => f.write_str("announcement path repeats a key"),
-            Self::CostAtRoot => f.write_str("announcement prices the link into its root"),
-            Self::FreeLink => f.write_str("announcement path contains a link costing nothing"),
             Self::BadSignature => {
                 f.write_str("announcement hop is not signed by the node it names")
             }
@@ -232,7 +170,7 @@ impl std::error::Error for MalformedAnnouncement {}
 impl Announcement {
     /// The announcement of a node that considers itself the root of its own tree.
     pub fn root_of<S: Signer>(signer: &S, seq: u64) -> Self {
-        Self::signed_onto(signer, Vec::new(), 0, None, seq)
+        Self::signed_onto(signer, Vec::new(), None, seq)
     }
 
     /// Builds an announcement from its parts, rejecting anything malformed or
@@ -244,14 +182,8 @@ impl Announcement {
         let Some((root, below)) = path.split_first() else {
             return Err(MalformedAnnouncement::EmptyPath);
         };
-        if root.cost != 0 {
-            return Err(MalformedAnnouncement::CostAtRoot);
-        }
         if root.consent.is_some() {
             return Err(MalformedAnnouncement::ConsentAtRoot);
-        }
-        if below.iter().any(|hop| hop.cost == 0) {
-            return Err(MalformedAnnouncement::FreeLink);
         }
         if below.iter().any(|hop| hop.consent.is_none()) {
             return Err(MalformedAnnouncement::MissingConsent);
@@ -274,10 +206,6 @@ impl Announcement {
     /// The announcement `signer`'s node would make by attaching itself below
     /// this one, on the strength of `consent`.
     ///
-    /// The price of the link is the one the parent named when it consented,
-    /// not one the child picks, so a node cannot advertise a bargain nobody
-    /// offered it.
-    ///
     /// Returns `None` when the consent is not this announcement's author
     /// agreeing to this signer, or when the signer's key already appears in
     /// the path. The second check is what keeps the tree loop-free: a node
@@ -297,7 +225,6 @@ impl Announcement {
         Some(Self::signed_onto(
             signer,
             self.path.clone(),
-            consent.cost.get(),
             Some(consent.signature),
             seq,
         ))
@@ -317,11 +244,10 @@ impl Announcement {
         // The author's own hop is the one being restamped, and there is always
         // one to take: `author` above just read it.
         let own = above.pop()?;
-        Some(Self::signed_onto(signer, above, own.cost, own.consent, seq))
+        Some(Self::signed_onto(signer, above, own.consent, seq))
     }
 
-    /// The walk `above`, with `signer`'s node signed onto the end of it at a
-    /// link costing `cost`.
+    /// The walk `above`, with `signer`'s node signed onto the end of it.
     ///
     /// The only place a hop is ever made, so that the three ways of arriving
     /// at an announcement — rooting, extending, restamping — cannot drift
@@ -329,15 +255,13 @@ impl Announcement {
     fn signed_onto<S: Signer>(
         signer: &S,
         mut above: Vec<Hop>,
-        cost: u64,
         consent: Option<Signature>,
         seq: u64,
     ) -> Self {
         let key = signer.public_key();
-        let signature = signer.sign(&signed_bytes(&above, key, cost, consent, seq));
+        let signature = signer.sign(&signed_bytes(&above, key, consent, seq));
         above.push(Hop {
             key,
-            cost,
             seq,
             consent,
             signature,
@@ -366,13 +290,13 @@ impl Announcement {
     /// Whether every hop was signed by the node it names.
     fn hops_signed<S: Signer>(&self) -> bool {
         self.path.iter().enumerate().all(|(index, hop)| {
-            let bytes = signed_bytes(&self.path[..index], hop.key, hop.cost, hop.consent, hop.seq);
+            let bytes = signed_bytes(&self.path[..index], hop.key, hop.consent, hop.seq);
             S::verify(hop.key, &bytes, &hop.signature)
         })
     }
 
     /// Whether every hop below the root carries the consent of the hop above
-    /// it, at the price the path claims, and the root carries none.
+    /// it, and the root carries none.
     fn consents_given<S: Signer>(&self) -> bool {
         self.path
             .iter()
@@ -383,7 +307,7 @@ impl Announcement {
                 (None, None) => true,
                 (Some(above), Some(consent)) => {
                     let parent = self.path[above].key;
-                    let bytes = consent_bytes(parent, hop.key, hop.cost);
+                    let bytes = consent_bytes(parent, hop.key);
                     S::verify(parent, &bytes, &consent)
                 }
                 _ => false,
@@ -428,16 +352,16 @@ impl Announcement {
             .map(|index| self.path[index].key)
     }
 
-    /// What the walk from the author up to the root costs.
+    /// How many links the walk from the author up to the root crosses.
     ///
     /// This is the number parent selection minimises, and it is zero exactly
     /// for a node that believes it is the root.
-    pub fn cost_to_root(&self) -> u64 {
-        total_cost(self.path.iter())
+    pub fn depth(&self) -> usize {
+        self.path.len() - 1
     }
 
-    /// Whether this describes the same walk as `other`: the same nodes at the
-    /// same prices, however either of them was stamped and signed.
+    /// Whether this describes the same walk as `other`: the same nodes in the
+    /// same order, however either of them was stamped and signed.
     ///
     /// This is the question "have I moved?", which the stamps must not answer.
     /// Comparing whole announcements would say yes every time anybody above
@@ -445,8 +369,7 @@ impl Announcement {
     /// changed.
     pub(crate) fn same_position(&self, other: &Self) -> bool {
         self.path.len() == other.path.len()
-            && std::iter::zip(&self.path, &other.path)
-                .all(|(here, there)| here.key == there.key && here.cost == there.cost)
+            && std::iter::zip(&self.path, &other.path).all(|(here, there)| here.key == there.key)
     }
 
     /// Whether this announcement replaces `other` in the set of known announcements.
@@ -467,54 +390,35 @@ impl Announcement {
     pub(crate) fn unchecked(path: Vec<Hop>) -> Self {
         Self { path }
     }
-
-    /// Orders candidate parents, most preferred first.
-    ///
-    /// Smallest root key wins, so the network agrees on one root; then the
-    /// cheapest walk to that root, which is the whole point of link cost; then
-    /// the fewest hops, since two equally priced walks are not equally cheap to
-    /// forward over; then the smallest path, so that ties are broken
-    /// identically everywhere and the tree has a single fixed point. Two
-    /// candidates always differ by the key of some hop before anything a stamp
-    /// could reach, so the ordering does not move when a sequence number does.
-    pub(crate) fn preference_cmp(&self, other: &Self) -> Ordering {
-        self.root()
-            .cmp(&other.root())
-            .then_with(|| self.cost_to_root().cmp(&other.cost_to_root()))
-            .then_with(|| self.path.len().cmp(&other.path.len()))
-            .then_with(|| self.path.cmp(&other.path))
-    }
 }
 
-/// What the walk between two nodes costs along the tree.
+/// How many links the walk between two nodes crosses along the tree.
 ///
 /// Both paths descend from the root, so they share a prefix ending at the two
 /// nodes' lowest common ancestor; the distance is the climb up to it plus the
-/// descent back down, each link counted at what it costs. Within one tree that
-/// is zero only between a node and itself, since no link is free.
+/// descent back down. Within one tree it is zero only between a node and
+/// itself.
 ///
-/// Two paths that disagree about the root share no prefix at all, and the
-/// result — what each of them pays to reach its own root — is well defined but
-/// says nothing about how far apart they are. That is the transient state
-/// routing tolerates by refusing to forward without strict progress: rather
-/// than trust the number, a node drops the packet.
+/// The number is a count of links and nothing else, which is what lets every
+/// node on a route agree about it. It is derived from keys that were signed,
+/// it cannot overflow anything, and there is no measurement anywhere in it for
+/// a peer to overstate — what a link costs is each node's own affair, and it
+/// is weighed separately, over its own links only.
+///
+/// Two paths that disagree about the root share no prefix at all, so what
+/// comes back is the length of both walks, each counted from its own root.
+/// The figure is well defined and says nothing about how far apart the two
+/// nodes are. That is the transient state routing tolerates by refusing to
+/// forward without strict progress: rather than trust the number, a node
+/// drops the packet.
 ///
 /// Only keys are compared to find the shared prefix, so two nodes holding
 /// differently stamped copies of the same walk still agree on where it forks.
-pub(crate) fn distance(a: &[Hop], b: &[Hop]) -> u64 {
+pub(crate) fn distance(a: &[Hop], b: &[Hop]) -> usize {
     let shared = a.iter().zip(b).take_while(|(x, y)| x.key == y.key).count();
     // Dropping the shared prefix leaves exactly the hops below the two nodes'
     // common ancestor: the climb from each of them up to it.
-    total_cost(a.iter().skip(shared)).saturating_add(total_cost(b.iter().skip(shared)))
-}
-
-/// What crossing every link in `hops` costs, saturating rather than wrapping.
-///
-/// The ceiling needs costs summing past `u64::MAX`, which no caller counting
-/// anything real can reach; a route that looks infinitely expensive still
-/// beats one that looks free.
-fn total_cost<'a>(hops: impl Iterator<Item = &'a Hop>) -> u64 {
-    hops.fold(0, |total, hop| total.saturating_add(hop.cost))
+    (a.len() - shared) + (b.len() - shared)
 }
 
 /// What a node is putting its name to when it signs its own hop.
@@ -522,13 +426,13 @@ fn total_cost<'a>(hops: impl Iterator<Item = &'a Hop>) -> u64 {
 /// Every kind of statement a node makes starts with one of these, so that
 /// bytes signed as one thing can never be read back as another however the
 /// rest of them line up.
-pub(crate) const HOP_DOMAIN: &[u8] = b"blackwood/hop/1";
+pub(crate) const HOP_DOMAIN: &[u8] = b"blackwood/hop/2";
 
 /// What a node is putting its name to when it agrees to carry a child.
-const CONSENT_DOMAIN: &[u8] = b"blackwood/consent/1";
+const CONSENT_DOMAIN: &[u8] = b"blackwood/consent/2";
 
 /// The bytes a hop is signed over: every hop above it exactly as it stands,
-/// signatures and all, followed by its own key, cost, sequence number and the
+/// signatures and all, followed by its own key, sequence number and the
 /// consent it sits on.
 ///
 /// Including the hops above by their signatures is what chains them. A hop
@@ -539,40 +443,31 @@ const CONSENT_DOMAIN: &[u8] = b"blackwood/consent/1";
 /// A missing consent is written as a signature of zeroes rather than left out,
 /// so every hop occupies the same width and no two different paths can lay
 /// themselves out as the same bytes.
-fn signed_bytes(
-    above: &[Hop],
-    key: PublicKey,
-    cost: u64,
-    consent: Option<Signature>,
-    seq: u64,
-) -> Vec<u8> {
+fn signed_bytes(above: &[Hop], key: PublicKey, consent: Option<Signature>, seq: u64) -> Vec<u8> {
     const NO_CONSENT: Signature = Signature::new([0; SIGNATURE_LEN]);
 
     let mut bytes = Vec::from(HOP_DOMAIN);
     for hop in above {
         bytes.extend_from_slice(hop.key.as_bytes());
-        bytes.extend_from_slice(&hop.cost.to_be_bytes());
         bytes.extend_from_slice(&hop.seq.to_be_bytes());
         bytes.extend_from_slice(hop.consent.unwrap_or(NO_CONSENT).as_bytes());
         bytes.extend_from_slice(hop.signature.as_bytes());
     }
     bytes.extend_from_slice(key.as_bytes());
-    bytes.extend_from_slice(&cost.to_be_bytes());
     bytes.extend_from_slice(&seq.to_be_bytes());
     bytes.extend_from_slice(consent.unwrap_or(NO_CONSENT).as_bytes());
     bytes
 }
 
-/// The bytes a parent signs to agree that `child` may sit below it at `cost`.
+/// The bytes a parent signs to agree that `child` may sit below it.
 ///
 /// Both keys are named, so a consent cannot be handed to a different child or
-/// presented as coming from a different parent, and the price is in there
-/// because agreeing to carry a node is agreeing to carry it at some price.
-fn consent_bytes(parent: PublicKey, child: PublicKey, cost: u64) -> Vec<u8> {
+/// presented as coming from a different parent. Nothing else is in there:
+/// agreeing to carry a node is the whole of what a parent is agreeing to.
+fn consent_bytes(parent: PublicKey, child: PublicKey) -> Vec<u8> {
     let mut bytes = Vec::from(CONSENT_DOMAIN);
     bytes.extend_from_slice(parent.as_bytes());
     bytes.extend_from_slice(child.as_bytes());
-    bytes.extend_from_slice(&cost.to_be_bytes());
     bytes
 }
 
@@ -589,45 +484,33 @@ mod tests {
         StandIn::for_key(key(n))
     }
 
-    fn cost(n: u64) -> Cost {
-        Cost::new(n).expect("a test cost is never zero")
-    }
-
-    /// `parent` agreeing to carry `child` over a link it prices at `price`.
-    fn consent(parent: u8, child: u8, price: u64) -> Consent {
-        Consent::issue(&signer(parent), key(child), cost(price))
+    /// `parent` agreeing to carry `child`.
+    fn consent(parent: u8, child: u8) -> Consent {
+        Consent::issue(&signer(parent), key(child))
     }
 
     /// An announcement for the node at the end of `root` + `steps`, built the
-    /// way a real one is: each node attaching below the last over a link of the
-    /// cost written beside it, on that node's consent, and signing its own hop
-    /// as it goes.
-    fn announcement(root: u8, steps: &[(u8, u64)]) -> Announcement {
+    /// way a real one is: each node attaching below the last on that node's
+    /// consent, and signing its own hop as it goes.
+    fn announcement(root: u8, steps: &[u8]) -> Announcement {
         let mut announcement = Announcement::root_of(&signer(root), 0);
         let mut above = root;
-        for &(node, price) in steps {
+        for &node in steps {
             announcement = announcement
-                .extend(&signer(node), &consent(above, node, price), 0)
+                .extend(&signer(node), &consent(above, node), 0)
                 .expect("the test path holds distinct keys");
             above = node;
         }
         announcement
     }
 
-    fn path(root: u8, steps: &[(u8, u64)]) -> Vec<Hop> {
+    fn path(root: u8, steps: &[u8]) -> Vec<Hop> {
         announcement(root, steps).path().to_vec()
     }
 
     /// The walk a path describes, with the stamps and signatures set aside.
-    fn walk(path: &[Hop]) -> Vec<(PublicKey, u64)> {
-        path.iter().map(|hop| (hop.key, hop.cost)).collect()
-    }
-
-    #[test]
-    fn a_cost_is_never_zero() {
-        assert_eq!(Cost::new(0), None);
-        assert_eq!(Cost::new(1), Some(Cost::UNIT));
-        assert_eq!(cost(7).get(), 7);
+    fn walk(path: &[Hop]) -> Vec<PublicKey> {
+        path.iter().map(|hop| hop.key).collect()
     }
 
     #[test]
@@ -637,7 +520,7 @@ mod tests {
             Err(MalformedAnnouncement::EmptyPath)
         );
 
-        let mut repeated = path(1, &[(2, 1)]);
+        let mut repeated = path(1, &[2]);
         repeated.push(Hop {
             key: key(1),
             ..repeated[1]
@@ -647,43 +530,29 @@ mod tests {
             Err(MalformedAnnouncement::RepeatedKey)
         );
 
-        let mut priced_root = path(1, &[]);
-        priced_root[0].cost = 1;
-        assert_eq!(
-            Announcement::new::<StandIn>(priced_root),
-            Err(MalformedAnnouncement::CostAtRoot)
-        );
-
-        let mut free = path(1, &[(2, 1)]);
-        free[1].cost = 0;
-        assert_eq!(
-            Announcement::new::<StandIn>(free),
-            Err(MalformedAnnouncement::FreeLink)
-        );
-
-        assert!(Announcement::new::<StandIn>(path(1, &[(2, 3)])).is_ok());
+        assert!(Announcement::new::<StandIn>(path(1, &[2])).is_ok());
     }
 
     #[test]
     fn rejects_a_walk_that_was_altered_after_it_was_signed() {
-        // Structurally perfect, and a lie: the price of the link into 2 rubbed
-        // out and a cheaper one written in, which would put 2 nearer the root
-        // than it has any right to be.
-        let mut cheaper = path(1, &[(2, 5)]);
-        cheaper[1].cost = 1;
+        // Structurally perfect, and a lie: a hop cut out of the middle, which
+        // would put 3 one link from the root instead of two and pull towards
+        // it every node choosing a parent nearby.
+        let mut shortened = path(1, &[2, 3]);
+        shortened.remove(1);
         assert_eq!(
-            Announcement::new::<StandIn>(cheaper),
+            Announcement::new::<StandIn>(shortened),
             Err(MalformedAnnouncement::BadSignature)
         );
 
-        let mut renamed = path(1, &[(2, 1)]);
+        let mut renamed = path(1, &[2]);
         renamed[1].key = key(9);
         assert_eq!(
             Announcement::new::<StandIn>(renamed),
             Err(MalformedAnnouncement::BadSignature)
         );
 
-        let mut restamped = path(1, &[(2, 1)]);
+        let mut restamped = path(1, &[2]);
         restamped[1].seq = 500;
         assert_eq!(
             Announcement::new::<StandIn>(restamped),
@@ -693,9 +562,9 @@ mod tests {
 
     #[test]
     fn rejects_a_walk_altered_above_the_node_that_would_gain_by_it() {
-        // The lie worth telling is not about one's own hop. 3 rubs out the
-        // price of the link into 2, above it, so that the whole walk down to
-        // it looks cheap and traffic for anything below comes its way — and
+        // The lie worth telling is not about one's own hop. 3 rewrites the
+        // stamp on 2's hop, above it, so that its own copy of the walk outranks
+        // the copy everybody else is holding when the two are compared — and
         // then signs its own hop over the altered walk, perfectly properly,
         // because that hop is the one thing here it is entitled to sign.
         //
@@ -703,16 +572,16 @@ mod tests {
         // holds the key it names. What cannot be re-made is the signature on
         // the altered hop itself, which is why the check is per hop and not
         // merely a matter of following the chain down from the bottom.
-        let mut above = path(1, &[(2, 9)]);
-        above[1].cost = 1;
+        let mut above = path(1, &[2]);
+        above[1].seq = 900;
         let forged = Announcement::unchecked(above)
-            .extend(&signer(3), &consent(2, 3, 1), 0)
+            .extend(&signer(3), &consent(2, 3), 0)
             .expect("distinct key attaches");
 
         assert!(
             StandIn::verify(
                 forged.path()[2].key,
-                &signed_bytes(&forged.path()[..2], key(3), 1, forged.path()[2].consent, 0),
+                &signed_bytes(&forged.path()[..2], key(3), forged.path()[2].consent, 0),
                 &forged.path()[2].signature,
             ),
             "3's own hop is beyond reproach"
@@ -729,7 +598,7 @@ mod tests {
 
     #[test]
     fn every_hop_is_signed_by_the_node_it_names() {
-        let announcement = announcement(1, &[(2, 1), (3, 1)]);
+        let announcement = announcement(1, &[2, 3]);
         assert!(announcement.verify::<StandIn>());
 
         // Not one signature over the whole thing by the author: three, one per
@@ -748,66 +617,65 @@ mod tests {
 
     #[test]
     fn a_hop_cannot_be_lifted_out_of_one_walk_into_another() {
-        // 3 sits below 2 in one tree and below 4 in another, at the same price
-        // and stamped the same. The two hops for 3 describe an identical step,
-        // but each signature commits to the whole walk above it, so neither
-        // hop is any use in the other's announcement.
-        let below_two = announcement(1, &[(2, 1), (3, 1)]);
-        let below_four = announcement(1, &[(4, 1), (3, 1)]);
+        // 3 sits below 2 in one tree and below 4 in another, stamped the same.
+        // The two hops for 3 describe an identical step, but each signature
+        // commits to the whole walk above it, so neither hop is any use in the
+        // other's announcement.
+        let below_two = announcement(1, &[2, 3]);
+        let below_four = announcement(1, &[4, 3]);
 
         let mut spliced = below_four.path().to_vec();
         spliced[2] = below_two.path()[2];
         assert_eq!(spliced[2].key, below_four.path()[2].key);
-        assert_eq!(spliced[2].cost, below_four.path()[2].cost);
         assert_eq!(spliced[2].seq, below_four.path()[2].seq);
 
         assert!(!Announcement::unchecked(spliced).verify::<StandIn>());
     }
 
     #[test]
-    fn extending_records_what_the_link_cost() {
+    fn extending_adds_one_link_to_the_walk() {
         let root = Announcement::root_of(&signer(1), 0);
-        assert_eq!(root.cost_to_root(), 0, "the root is already there");
+        assert_eq!(root.depth(), 0, "the root is already there");
 
         let child = root
-            .extend(&signer(2), &consent(1, 2, 4), 0)
+            .extend(&signer(2), &consent(1, 2), 0)
             .expect("distinct key attaches");
-        assert_eq!(walk(child.path()), [(key(1), 0), (key(2), 4)]);
+        assert_eq!(walk(child.path()), [key(1), key(2)]);
         assert_eq!(child.parent(), Some(key(1)));
         assert_eq!(child.author(), key(2));
         assert_eq!(child.root(), key(1));
-        assert_eq!(child.cost_to_root(), 4);
+        assert_eq!(child.depth(), 1);
         assert!(child.verify::<StandIn>());
 
         let grandchild = child
-            .extend(&signer(3), &consent(2, 3, 5), 0)
+            .extend(&signer(3), &consent(2, 3), 0)
             .expect("distinct key attaches");
-        assert_eq!(grandchild.cost_to_root(), 9, "costs add up the path");
+        assert_eq!(grandchild.depth(), 2, "links add up the path");
         assert!(grandchild.verify::<StandIn>());
     }
 
     #[test]
     fn extending_refuses_to_form_a_loop() {
-        let child = announcement(1, &[(2, 1)]);
-        assert_eq!(child.extend(&signer(1), &consent(2, 1, 1), 0), None);
-        assert_eq!(child.extend(&signer(2), &consent(2, 2, 1), 0), None);
+        let child = announcement(1, &[2]);
+        assert_eq!(child.extend(&signer(1), &consent(2, 1), 0), None);
+        assert_eq!(child.extend(&signer(2), &consent(2, 2), 0), None);
     }
 
     #[test]
     fn extending_refuses_a_consent_meant_for_somebody_else() {
-        let child = announcement(1, &[(2, 1)]);
+        let child = announcement(1, &[2]);
         assert_eq!(
-            child.extend(&signer(3), &consent(2, 4, 1), 0),
+            child.extend(&signer(3), &consent(2, 4), 0),
             None,
             "2 agreed to carry 4, not 3"
         );
         assert_eq!(
-            child.extend(&signer(3), &consent(1, 3, 1), 0),
+            child.extend(&signer(3), &consent(1, 3), 0),
             None,
             "1 is not the node 3 would be sitting below"
         );
         assert!(
-            child.extend(&signer(3), &consent(2, 3, 1), 0).is_some(),
+            child.extend(&signer(3), &consent(2, 3), 0).is_some(),
             "the bargain 3 actually holds"
         );
     }
@@ -818,13 +686,12 @@ mod tests {
         // answer, say — holds every signature in it, and can sign its own hop
         // onto the end perfectly properly. What it cannot supply is the other
         // half of the bargain, and that is what stops it.
-        let stranger = announcement(1, &[(2, 1)]);
+        let stranger = announcement(1, &[2]);
         let mut spliced = stranger.path().to_vec();
         spliced.push(Hop {
             key: key(9),
-            cost: 1,
             seq: 0,
-            consent: Some(consent(2, 9, 1).signature()),
+            consent: Some(consent(2, 9).signature()),
             signature: Signature::new([0; SIGNATURE_LEN]),
         });
         // With a consent 2 really gave, only the intruder's own hop is wrong.
@@ -835,7 +702,7 @@ mod tests {
 
         // Signed properly by the intruder, but sitting on nobody's agreement.
         let unwelcome = Announcement::unchecked(stranger.path().to_vec())
-            .extend(&signer(9), &consent(2, 9, 1), 0)
+            .extend(&signer(9), &consent(2, 9), 0)
             .expect("the intruder can sign its own hop");
         assert!(unwelcome.verify::<StandIn>(), "2 did agree to this one");
 
@@ -850,15 +717,14 @@ mod tests {
         // signs its own hop perfectly properly over it — that hop is the one
         // thing here it is entitled to sign — so nothing about the walk gives
         // it away except the agreement it is standing on.
-        let above = announcement(1, &[(2, 1)]).path().to_vec();
-        let elsewhere = consent(5, 9, 1).signature();
+        let above = announcement(1, &[2]).path().to_vec();
+        let elsewhere = consent(5, 9).signature();
         let mut borrowed = above.clone();
         borrowed.push(Hop {
             key: key(9),
-            cost: 1,
             seq: 0,
             consent: Some(elsewhere),
-            signature: signer(9).sign(&signed_bytes(&above, key(9), 1, Some(elsewhere), 0)),
+            signature: signer(9).sign(&signed_bytes(&above, key(9), Some(elsewhere), 0)),
         });
         assert_eq!(
             Announcement::new::<StandIn>(borrowed),
@@ -867,7 +733,7 @@ mod tests {
         );
 
         let mut at_root = announcement(1, &[]).path().to_vec();
-        at_root[0].consent = Some(consent(2, 1, 1).signature());
+        at_root[0].consent = Some(consent(2, 1).signature());
         assert_eq!(
             Announcement::new::<StandIn>(at_root),
             Err(MalformedAnnouncement::ConsentAtRoot)
@@ -881,7 +747,7 @@ mod tests {
 
     #[test]
     fn restamping_leaves_the_walk_where_it_was_and_still_checks_out() {
-        let before = announcement(1, &[(2, 1), (3, 1)]);
+        let before = announcement(1, &[2, 3]);
         let after = before
             .with_seq(&signer(3), 7)
             .expect("the author may restamp");
@@ -902,14 +768,14 @@ mod tests {
 
     #[test]
     fn only_the_author_can_restamp() {
-        let announcement = announcement(1, &[(2, 1), (3, 1)]);
+        let announcement = announcement(1, &[2, 3]);
         assert_eq!(announcement.with_seq(&signer(2), 7), None, "its parent");
         assert_eq!(announcement.with_seq(&signer(9), 7), None, "a stranger");
     }
 
     #[test]
     fn the_same_walk_is_the_same_position_however_it_was_stamped() {
-        let announcement = announcement(1, &[(2, 1)]);
+        let announcement = announcement(1, &[2]);
         let restamped = announcement
             .with_seq(&signer(2), 99)
             .expect("the author may restamp");
@@ -920,18 +786,15 @@ mod tests {
     }
 
     #[test]
-    fn a_re_priced_walk_is_a_different_position() {
-        // The same nodes in the same order, over a link measured again and
-        // found worse. Nothing about the shape of the walk moved, but what it
-        // costs to follow did, and a node that called this standing still
-        // would keep the new price to itself and leave everyone below it
-        // working from the old one.
-        let before = announcement(1, &[(2, 1)]);
-        let after = announcement(1, &[(2, 5)]);
-
-        let keys = |a: &Announcement| a.path().iter().map(|hop| hop.key).collect::<Vec<_>>();
-        assert_eq!(keys(&before), keys(&after), "nobody moved");
-        assert!(!before.same_position(&after));
+    fn a_position_is_the_nodes_and_nothing_else() {
+        // Which nodes, in which order, is the whole of where a node sits, so
+        // the only way to move is to change them. What a link costs is not in
+        // here to change: it is each node's own measurement of its own links,
+        // and re-measuring one never leaves a node with something to say.
+        let position = announcement(1, &[2, 3]);
+        assert!(position.same_position(&announcement(1, &[2, 3])));
+        assert!(!position.same_position(&announcement(1, &[4, 3])));
+        assert!(!position.same_position(&announcement(1, &[2])));
     }
 
     #[test]
@@ -950,8 +813,8 @@ mod tests {
         // rule has to answer anyway and answer the same way everywhere, or
         // two nodes holding both would keep different ones and disagree
         // about where their common neighbour sits.
-        let through_two = announcement(1, &[(2, 1), (5, 1)]);
-        let through_three = announcement(1, &[(3, 1), (5, 1)]);
+        let through_two = announcement(1, &[2, 5]);
+        let through_three = announcement(1, &[3, 5]);
         assert_eq!(through_two.seq(), through_three.seq());
 
         assert!(through_three.supersedes(&through_two));
@@ -962,133 +825,35 @@ mod tests {
     }
 
     #[test]
-    fn preference_favours_the_smallest_root_then_the_cheapest_walk_to_it() {
-        let low_root_dear = announcement(1, &[(9, 4), (5, 4)]);
-        let high_root_cheap = announcement(2, &[(5, 1)]);
-        assert_eq!(
-            low_root_dear.preference_cmp(&high_root_cheap),
-            Ordering::Less,
-            "a smaller root outweighs any price"
-        );
-
-        let cheap = announcement(1, &[(5, 1)]);
-        assert_eq!(cheap.preference_cmp(&low_root_dear), Ordering::Less);
-    }
-
-    #[test]
-    fn preference_takes_the_long_way_round_when_it_is_cheaper() {
-        let direct = announcement(1, &[(5, 10)]);
-        let round_about = announcement(1, &[(3, 1), (4, 1), (5, 1)]);
-        assert_eq!(
-            round_about.preference_cmp(&direct),
-            Ordering::Less,
-            "three cheap links beat one expensive one"
-        );
-    }
-
-    #[test]
-    fn preference_breaks_a_priced_tie_on_hops() {
-        let two_hops = announcement(1, &[(3, 1), (5, 1)]);
-        let one_hop = announcement(1, &[(5, 2)]);
-        assert_eq!(two_hops.cost_to_root(), one_hop.cost_to_root());
-        assert_eq!(one_hop.preference_cmp(&two_hops), Ordering::Less);
-    }
-
-    #[test]
-    fn preference_breaks_a_dead_heat_on_the_walk_itself() {
-        // Same root, same price, same number of hops, and still one of them
-        // has to win. What it settles on matters less than that every node
-        // settles on it: this is the last tie-break, and without it the tree
-        // would have no single fixed point to come to rest at.
-        let through_three = announcement(1, &[(3, 1), (5, 1)]);
-        let through_four = announcement(1, &[(4, 1), (5, 1)]);
-        assert_eq!(through_three.cost_to_root(), through_four.cost_to_root());
-        assert_eq!(through_three.path().len(), through_four.path().len());
-
-        assert_eq!(through_three.preference_cmp(&through_four), Ordering::Less);
-        assert_eq!(
-            through_four.preference_cmp(&through_three),
-            Ordering::Greater
-        );
-    }
-
-    #[test]
-    fn preference_does_not_move_when_a_sequence_number_does() {
-        // Two candidates always part company at some hop's key, which is
-        // compared before anything a restamp could reach. If they did not, a
-        // node would change its mind every time somebody above it reissued.
-        let left = announcement(1, &[(3, 1), (5, 1)]);
-        let right = announcement(1, &[(4, 1), (5, 1)]);
-        let before = left.preference_cmp(&right);
-
-        let restamped = left.with_seq(&signer(5), 400).expect("the author");
-        assert_eq!(restamped.preference_cmp(&right), before);
-    }
-
-    #[test]
-    fn distance_counts_hops_when_every_link_costs_the_same() {
+    fn distance_counts_the_links_through_the_common_ancestor() {
         let root = path(1, &[]);
-        let child = path(1, &[(2, 1)]);
-        let grandchild = path(1, &[(2, 1), (3, 1)]);
-        let cousin = path(1, &[(4, 1)]);
+        let child = path(1, &[2]);
+        let grandchild = path(1, &[2, 3]);
+        let cousin = path(1, &[4]);
 
         assert_eq!(distance(&root, &root), 0);
         assert_eq!(distance(&root, &child), 1);
         assert_eq!(distance(&root, &grandchild), 2);
-        assert_eq!(distance(&grandchild, &cousin), 3);
+        assert_eq!(
+            distance(&grandchild, &cousin),
+            3,
+            "up to the root and back down"
+        );
         assert_eq!(distance(&cousin, &grandchild), 3, "distance is symmetric");
     }
 
     #[test]
-    fn distance_adds_up_the_links_through_the_common_ancestor() {
-        let grandchild = path(1, &[(2, 5), (3, 7)]);
-        let cousin = path(1, &[(4, 2)]);
-
-        assert_eq!(distance(&grandchild, &grandchild), 0);
-        assert_eq!(distance(&path(1, &[(2, 5)]), &grandchild), 7);
-        assert_eq!(
-            distance(&grandchild, &cousin),
-            7 + 5 + 2,
-            "up to the root and back down"
-        );
-    }
-
-    #[test]
     fn two_walks_that_disagree_about_the_root_share_no_prefix() {
-        // Nothing is comparable across two trees, and what comes out is only
-        // what each walk pays to reach its own root. The number is well
-        // defined and means nothing, which is exactly the transient state
+        // Nothing is comparable across two trees. What comes out is the two
+        // walks laid end to end, each counted from its own root, and the root
+        // hops are in there because neither walk shares them. The number is
+        // well defined and means nothing, which is exactly the transient state
         // forwarding survives by demanding strict progress: offered a figure
         // like this one, a node drops the packet rather than trusting it.
-        let mine = path(1, &[(2, 3)]);
-        let theirs = path(4, &[(5, 7)]);
+        let mine = path(1, &[2]);
+        let theirs = path(4, &[5]);
 
-        assert_eq!(distance(&mine, &theirs), 3 + 7);
-    }
-
-    #[test]
-    fn a_walk_priced_past_the_ceiling_saturates_rather_than_wrapping() {
-        // Out of reach of any caller counting anything real, and it still has
-        // to be the right kind of wrong: a route that looks infinitely
-        // expensive is merely never chosen, where one that wrapped back round
-        // to nothing would look like the best in the network. Nor may the
-        // arithmetic be what decides it — a node does not panic.
-        let mut mine = path(1, &[(2, 1), (4, 1)]);
-        mine[1].cost = u64::MAX;
-        mine[2].cost = u64::MAX;
-        let mut theirs = path(1, &[(3, 1)]);
-        theirs[1].cost = u64::MAX;
-
-        assert_eq!(
-            Announcement::unchecked(mine.clone()).cost_to_root(),
-            u64::MAX,
-            "two links of it are not cheaper than one"
-        );
-        assert_eq!(
-            distance(&mine, &theirs),
-            u64::MAX,
-            "nor is the walk between two of them"
-        );
+        assert_eq!(distance(&mine, &theirs), 2 + 2);
     }
 
     #[test]
@@ -1098,12 +863,12 @@ mod tests {
         // it had not made. The stamp that has to be overlooked is one *inside*
         // the shared part: 2 reissued, and only one of these two walks was
         // built after it did.
-        let mine = announcement(1, &[(2, 1), (3, 1)]);
-        let reissued = announcement(1, &[(2, 1)])
+        let mine = announcement(1, &[2, 3]);
+        let reissued = announcement(1, &[2])
             .with_seq(&signer(2), 300)
             .expect("the author may restamp");
         let theirs = reissued
-            .extend(&signer(4), &consent(2, 4, 1), 0)
+            .extend(&signer(4), &consent(2, 4), 0)
             .expect("distinct key attaches");
 
         assert_ne!(

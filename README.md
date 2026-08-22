@@ -12,7 +12,7 @@ forwarding towards the destination in the metric that embedding induces.
 one page: add and remove nodes and links, move the clock forward, and watch a
 packet find its way.
 
-[![The viewer showing a five-node network](docs/viewer.png)](https://zbarnett.github.io/blackwood/)
+[![The viewer showing a six-node network](docs/viewer.png)](https://zbarnett.github.io/blackwood/)
 
 ## The core
 
@@ -25,9 +25,9 @@ holds about each peer is a max register whose join is simply the greater of the
 two — a repeat, or one that arrives out of order, can be dropped on sight.
 
 The distance between two nodes is the walk up to their lowest common ancestor
-and back down, each link counted at what it costs to cross. A node forwards a
-packet to whichever peer stands strictly closer to the destination. Three
-properties follow, each from a local rule:
+and back down, counted in links. A node forwards a packet to whichever peer
+stands strictly closer to the destination. Three properties follow, each from a
+local rule:
 
 - **Loop-free forwarding.** Distance strictly decreases at every hop and is
   bounded below by zero, so a packet cannot revisit a node.
@@ -35,18 +35,22 @@ properties follow, each from a local rule:
   to sit below a path that already runs through it. Staleness can cost a node
   its route, never its acyclicity.
 - **Delivery on a settled tree.** A node's tree neighbour towards the
-  destination is always closer by exactly what the link between them costs, so
-  there is always a next hop.
+  destination is always exactly one link closer, so there is always a next hop.
 
-Both decisions weigh what a link costs — latency, in ironwood; whatever the
-caller measures, here. A node sits below the peer offering the cheapest walk to
-the root rather than the shortest one, and among the peers that make strict
-progress it hands a packet to whichever leaves the least left to pay. A cost is
-never zero, which is what keeps the two properties above standing; a network
-whose links all cost the same measures distance in hops. A link is priced by
-the node above it, because that is the node agreeing to carry the traffic
-across it — see [signing](#signing) for why the other way round is an invitation
-to lie.
+Every link also costs something to cross — latency, in ironwood; whatever the
+caller measures, here — and that number is strictly local. It is never
+announced, never signed and never quoted at a peer: a node measures its own
+links and spends the measurement on its own decisions. It breaks ties. Among
+peers offering equally short walks to the root a node sits below the one it can
+reach most cheaply; among peers that leave a packet the same distance to
+travel, it hands the packet to the cheapest.
+
+Keeping the price out of the shared metric is what makes it free to be wrong.
+Nothing sums it, so no peer can inflate it to swamp anybody's arithmetic; the
+two ends of a link need not agree on it; and a caller that re-measures its
+links every second sends nothing at all, because a price it changes its mind
+about is news to nobody. What the network agrees on is a count of links,
+derived from keys that were signed.
 
 The destination's path travels in the packet, since no node along the way holds
 it. That is also what makes the first property exact rather than nearly so:
@@ -79,23 +83,21 @@ of the network.
 
 Every hop of an announcement carries two signatures: the node it names, over
 that hop and over every hop above it exactly as they stand, and the node in the
-hop above, over this one's key and the price of the link between them. A walk
-down the tree is a chain of bargains, each struck by the two nodes it joins.
-Nobody can put a node somewhere it has not put itself, nobody can put itself
-somewhere it has not been invited, and no part of one announcement can be
-lifted into another.
+hop above, over this one's key. A walk down the tree is a chain of bargains,
+each struck by the two nodes it joins. Nobody can put a node somewhere it has
+not put itself, nobody can put itself somewhere it has not been invited, and no
+part of one announcement can be lifted into another.
 
 That second signature is what a lying node runs into. A position is the one
 thing a node says that is really about two nodes, and it is the profitable
-thing to lie about: claim a link you do not have, price it at nothing, and you
-are advertising the cheapest walk to the root in the neighbourhood. Your peers
-sit below you because that is exactly what the rule tells them to do — and
-every one of them is then unreachable, because the walk the rest of the network
-is routing them by runs through a link that does not exist. The packets die at
-whoever is named on the far end of it, who has no idea why. The lie is as
-attractive as it is destructive, which is what made it worth closing. The price
-travels in the consent for the same reason: the parent is the end that has to
-carry the traffic, so a child cannot advertise a bargain nobody offered it.
+thing to lie about: claim a link you do not have and you are advertising a
+shorter walk to the root than anybody else in the neighbourhood can offer. Your
+peers sit below you because that is exactly what the rule tells them to do —
+and every one of them is then unreachable, because the walk the rest of the
+network is routing them by runs through a link that does not exist. The packets
+die at whoever is named on the far end of it, who has no idea why. The lie is
+as attractive as it is destructive, which is what made it worth closing. A link
+has two ends, and both of them have to sign.
 
 Signing settles who, and never when. A signature is as good on a long-dead
 announcement as on a fresh one, and a node hearing about another for the first
@@ -155,12 +157,11 @@ a unit it has no way of knowing. That is what makes a network of them
 deterministically simulatable, and what should make the argument above tractable
 to check in a proof assistant.
 
-Two things ironwood does are left out, both hardening rather than part of the
-model: a parent does not sign for its children, so a node can claim to sit below
-a peer that never agreed to it, and summaries and searches are unsigned because
-there is nobody but their sender who could sign them.
-[`routing-core/src/lib.rs`](routing-core/src/lib.rs) records what each would
-cost to close.
+One thing ironwood does is left out, and it is hardening rather than part of
+the model: summaries and searches are unsigned, because there is nobody but
+their sender who could sign them.
+[`routing-core/src/lib.rs`](routing-core/src/lib.rs) records what closing that
+would cost.
 
 ## Layout
 

@@ -114,9 +114,9 @@
         Remove {from ?? 'node'}
       </button>
       <span class="divider"></span>
-      <label class="cost" title="what the link costs to cross — a node prefers the cheapest walk to the root, not the shortest">
+      <label class="cost" title="what the link costs to cross, as both ends of it measure — a node never tells anybody, and uses it only to choose between peers that are otherwise equally good">
         cost
-        <input type="number" min="1" max="99" bind:value={cost} />
+        <input type="number" min="0" max="99" bind:value={cost} />
       </label>
       <button disabled={to === undefined} onclick={() => call('link/add', { a: from, b: to, cost })}>
         Link
@@ -176,7 +176,7 @@
       <span class="swatch tree"></span> tree link
       <span class="swatch other"></span> other link
       <span class="swatch searched"></span> searched
-      <span class="dim spacer">numbers on links are what they cost to cross</span>
+      <span class="dim spacer">numbers on links are what they cost to cross, and go nowhere near the network</span>
     </p>
   </section>
 
@@ -184,7 +184,7 @@
     <h2>Nodes</h2>
     <table>
       <thead>
-        <tr><th>id</th><th title="the first three bytes of its ed25519 public key — the address it actually answers to, and what the root is chosen by">key</th><th>root</th><th>parent</th><th>path</th><th title="what the walk from this node up to the root costs">cost</th><th>peers</th><th title="the positions it holds: its peers, and whoever it has looked up and not yet forgotten">knows</th></tr>
+        <tr><th>id</th><th title="the first three bytes of its ed25519 public key — the address it actually answers to, and what the root is chosen by">key</th><th>root</th><th>parent</th><th>path</th><th title="how many links the walk from this node up to the root crosses">depth</th><th>peers</th><th title="the positions it holds: its peers, and whoever it has looked up and not yet forgotten">knows</th></tr>
       </thead>
       <tbody>
         {#each nodes as node (node.id)}
@@ -194,7 +194,7 @@
             <td>{node.root}</td>
             <td>{node.parent ?? '—'}</td>
             <td class="mono">{node.path.join('·')}</td>
-            <td class="mono">{node.cost}</td>
+            <td class="mono">{node.depth}</td>
             <td class="mono">{node.peers.join(' ') || '—'}</td>
             <td class="mono">{node.knows}</td>
           </tr>
@@ -239,11 +239,15 @@
     </p>
 
     <p class="caveat">
-      Every link costs something to cross, and a node sits below whichever peer
-      offers it the cheapest walk to the root rather than the shortest one.
-      <code>2–4</code> starts out costing 5, which is why <code>4</code> hangs off
-      <code>3</code> the long way round; re-price it to 1 and watch the tree
-      snap back.
+      Every link costs something to cross, but what it costs never leaves the
+      node that measured it: no announcement carries a price and no peer is
+      ever told one. It is spent only where the rules everybody shares run out.
+      <code>2</code> and <code>3</code> sit the same distance below the root,
+      so nothing in the walks themselves can settle which of them
+      <code>4</code> should hang off — what settles it is that <code>4</code>
+      measures <code>3–4</code> at 1 and <code>2–4</code> at 5. Re-price
+      <code>3–4</code> to 9 and watch <code>4</code> change sides without a
+      word being said about the price to anybody.
     </p>
 
     <p class="caveat">
