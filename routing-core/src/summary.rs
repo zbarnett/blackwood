@@ -14,12 +14,18 @@ use crate::key::PublicKey;
 /// A key that was inserted always tests present, so a search guided by
 /// summaries never overlooks the branch its target is really on. A key that was
 /// not may test present anyway, which costs a search a wasted detour and
-/// nothing else. With [`Summary::BITS`] bits and [`Summary::HASHES`] of them
-/// set per key, that happens for roughly one key in four hundred at sixteen
-/// nodes to a summary, one in forty at thirty-two, and one in two at a hundred
-/// and twenty-eight. Ironwood uses a filter thirty-two times this size;
+/// nothing else. With [`Summary::BITS`] bits and four of them set per key, that
+/// happens for roughly one key in four hundred at sixteen nodes to a summary,
+/// one in forty at thirty-two, and one in two at a hundred and twenty-eight.
+/// Ironwood uses a filter thirty-two times this size;
 /// [`BITS`](Summary::BITS) is the only thing standing between this and a
 /// network of that size.
+///
+/// Folding summaries together is the core's own business, so a caller cannot
+/// build one — only ask a summary it was handed what it
+/// [`contains`](Self::contains), and see how [`filled`](Self::filled) it is. A
+/// wire format would need its bytes; see the crate documentation for why there
+/// is no way to get them yet.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Summary {
     words: [u64; Summary::BITS / 64],
@@ -29,18 +35,19 @@ impl Summary {
     /// How many bits a summary holds.
     pub const BITS: usize = 256;
 
-    /// How many of them each key sets.
-    pub const HASHES: usize = 4;
+    /// How many of them each key sets. Internal tuning: a caller has no
+    /// summary of its own to build, so nothing outside can act on it.
+    const HASHES: usize = 4;
 
     /// The summary of nothing at all, which claims no key.
-    pub const fn new() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
             words: [0; Self::BITS / 64],
         }
     }
 
     /// Records that `key` is reachable.
-    pub fn insert(&mut self, key: PublicKey) {
+    pub(crate) fn insert(&mut self, key: PublicKey) {
         for round in 0..Self::HASHES {
             let bit = position(key, round);
             self.words[bit / 64] |= 1 << (bit % 64);
@@ -63,7 +70,7 @@ impl Summary {
     /// This is how a summary is built from the ones a node's other links gave
     /// it: the union is exact, which is what lets a node describe a whole
     /// subtree without ever holding it.
-    pub fn union(&mut self, other: &Self) {
+    pub(crate) fn union(&mut self, other: &Self) {
         for (word, more) in self.words.iter_mut().zip(&other.words) {
             *word |= more;
         }
@@ -75,15 +82,6 @@ impl Summary {
     /// which is the only warning a Bloom filter ever gives.
     pub fn filled(&self) -> u32 {
         self.words.iter().map(|word| word.count_ones()).sum()
-    }
-}
-
-impl Default for Summary {
-    /// The same empty summary [`new`](Summary::new) builds, so that the two
-    /// cannot drift apart. It is here because a type with a `new` taking no
-    /// arguments is expected to have it, not because anything needs it.
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -153,14 +151,6 @@ mod tests {
         let summary = Summary::new();
         assert_eq!(summary.filled(), 0);
         assert!(!summary.contains(key(1)));
-    }
-
-    #[test]
-    fn the_default_summary_is_the_empty_one() {
-        // Only here because a type with a `new` taking no arguments is
-        // expected to have it. Stated so that the two cannot drift apart and
-        // leave a caller with a filter that quietly claims something.
-        assert_eq!(Summary::default(), Summary::new());
     }
 
     #[test]

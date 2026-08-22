@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, VecDeque};
 use blackwood_ed25519::Ed25519;
 use routing_core::{
     Announcement, Cost, MalformedAnnouncement, Message, Node, Packet, PublicKey, SIGNATURE_LEN,
-    Signature, Signer,
+    Signature, Signer, Timing,
 };
 
 /// A message in flight, from one node to a linked peer.
@@ -37,7 +37,8 @@ impl Network {
             .map(|seed| {
                 let signer = Ed25519::from_seed([seed; 32]);
                 let key = signer.key();
-                net.nodes.insert(key, Node::new(0, signer));
+                net.nodes
+                    .insert(key, Node::new(0, signer, Timing::MILLISECONDS));
                 key
             })
             .collect();

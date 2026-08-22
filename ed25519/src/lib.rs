@@ -7,14 +7,14 @@
 //! code lives here, on this side of the boundary, and the core never sees it.
 //!
 //! ```
-//! use routing_core::{Cost, Node, Signer};
+//! use routing_core::{Cost, Node, Signer, Timing};
 //! use blackwood_ed25519::Ed25519;
 //!
 //! let alice = Ed25519::from_seed([1; 32]);
 //! let bob = Ed25519::from_seed([2; 32]);
 //! let (alice_key, bob_key) = (alice.public_key(), bob.public_key());
 //!
-//! let mut node = Node::new(0, alice);
+//! let mut node = Node::new(0, alice, Timing::MILLISECONDS);
 //! node.add_peer(0, bob_key, Cost::UNIT);
 //! assert_eq!(node.key(), alice_key);
 //! ```

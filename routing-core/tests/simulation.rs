@@ -101,7 +101,7 @@ impl Network {
         Self {
             nodes: keys
                 .into_iter()
-                .map(|k| (k, Node::new(0, signer(k))))
+                .map(|k| (k, Node::new(0, signer(k), Timing::MILLISECONDS)))
                 .collect(),
             queue: VecDeque::new(),
             hops: 0,
@@ -146,7 +146,7 @@ impl Network {
     /// go, because a jump would look to every node as though the whole network
     /// had fallen silent for the entire interval.
     fn advance(&mut self, by: u64) {
-        let step = Timing::DEFAULT.refresh;
+        let step = Timing::MILLISECONDS.refresh;
         let target = self.now + by;
         while self.now < target {
             self.now = (self.now + step).min(target);
@@ -591,7 +591,7 @@ fn a_settled_network_is_undisturbed_by_the_passage_of_time() {
 
     // Long enough that every announcement would have expired many times over
     // had it not been reissued.
-    net.advance(Timing::DEFAULT.expiry * 10);
+    net.advance(Timing::MILLISECONDS.expiry * 10);
 
     assert_eq!(
         net.positions(&keys),
@@ -627,7 +627,7 @@ fn a_stranded_node_is_eventually_forgotten() {
     assert!(net.node_mut(a).send(e, b"still there?".to_vec()).is_ok());
     assert!(net.find(a, e).is_empty(), "no branch admits e any more");
 
-    net.advance(Timing::DEFAULT.expiry);
+    net.advance(Timing::MILLISECONDS.expiry);
 
     for node in [a, b, c, d] {
         assert!(
@@ -651,13 +651,14 @@ fn a_node_that_starts_over_rejoins_the_tree() {
     // e leaves and, over the course of the outage, is forgotten. Meanwhile the
     // e that is still running climbs to a much higher sequence number.
     net.unlink(d, e);
-    net.advance(Timing::DEFAULT.expiry * 4);
+    net.advance(Timing::MILLISECONDS.expiry * 4);
     assert!(!net.node(d).known().any(|known| known == e));
 
     // It comes back as a fresh process would: same key, sequence numbers back
     // at zero. Without expiry that announcement would look like ancient news
     // and every node would go on routing towards where e used to be.
-    net.nodes.insert(e, Node::new(net.now, signer(e)));
+    net.nodes
+        .insert(e, Node::new(net.now, signer(e), Timing::MILLISECONDS));
     net.link(d, e, Cost::UNIT);
     net.run();
 

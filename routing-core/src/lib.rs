@@ -107,6 +107,14 @@
 //!   could sign it. Lying costs a search a wasted detour or an unanswered
 //!   question; it cannot deliver a packet to the wrong node.
 //!
+//! One thing is simply not here yet. An [`Announcement`] can be taken apart
+//! into [`Hop`]s and put back together through [`Announcement::new`], which is
+//! the seam a wire format decodes through; a [`Summary`] has no such seam, so a
+//! [`Message::Summary`] cannot be encoded by anything outside this crate. The
+//! bits are a plain array and exposing them is a few lines, but nothing in this
+//! repository sends a message over a wire, and an accessor nothing calls is an
+//! accessor nothing has checked.
+//!
 //! # Signing
 //!
 //! Every hop of an announcement carries the signature of the node it names,
@@ -164,10 +172,13 @@
 //! let (a, b) = (PublicKey::new([1; 32]), PublicKey::new([2; 32]));
 //!
 //! // A node's address is whatever key it can sign as, so an identity and the
-//! // means of proving it arrive together and cannot come apart.
+//! // means of proving it arrive together and cannot come apart. The schedule
+//! // is handed over for the same reason the signer is: the instants below are
+//! // milliseconds because this caller says so, not because the core assumed a
+//! // unit it has no way of knowing.
 //! let (mut a_node, mut b_node) = (
-//!     Node::new(0, NoSecret(a)),
-//!     Node::new(0, NoSecret(b)),
+//!     Node::new(0, NoSecret(a), Timing::MILLISECONDS),
+//!     Node::new(0, NoSecret(b), Timing::MILLISECONDS),
 //! );
 //!
 //! // Bring up the link, then hand each side what the other offered. Nothing
@@ -197,7 +208,7 @@
 //! assert_eq!(b_node.take_delivered()[0].payload, b"hello");
 //!
 //! // Let time pass with nothing arriving from a, and b forgets where it sat.
-//! b_node.tick(Timing::DEFAULT.expiry);
+//! b_node.tick(Timing::MILLISECONDS.expiry);
 //! assert_eq!(b_node.root(), b);
 //! ```
 
@@ -222,4 +233,4 @@ pub use message::{Envelope, Found, Lookup, Message, Packet, Traffic};
 pub use node::{Node, SendError, Timing};
 pub use signature::{SIGNATURE_LEN, Signature, Signer};
 pub use summary::Summary;
-pub use tree::{Announcement, Cost, Hop, MalformedAnnouncement, distance};
+pub use tree::{Announcement, Cost, Hop, MalformedAnnouncement};

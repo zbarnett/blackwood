@@ -123,16 +123,7 @@ impl std::error::Error for MalformedAnnouncement {}
 impl Announcement {
     /// The announcement of a node that considers itself the root of its own tree.
     pub fn root_of<S: Signer>(signer: &S, seq: u64) -> Self {
-        let key = signer.public_key();
-        let signature = signer.sign(&signed_bytes(&[], key, 0, seq));
-        Self {
-            path: vec![Hop {
-                key,
-                cost: 0,
-                seq,
-                signature,
-            }],
-        }
+        Self::signed_onto(signer, Vec::new(), 0, seq)
     }
 
     /// Builds an announcement from its parts, rejecting anything malformed or
@@ -174,15 +165,12 @@ impl Announcement {
         if self.path.iter().any(|hop| hop.key == child) {
             return None;
         }
-        let signature = signer.sign(&signed_bytes(&self.path, child, cost.get(), seq));
-        let mut path = self.path.clone();
-        path.push(Hop {
-            key: child,
-            cost: cost.get(),
+        Some(Self::signed_onto(
+            signer,
+            self.path.clone(),
+            cost.get(),
             seq,
-            signature,
-        });
-        Some(Self { path })
+        ))
     }
 
     /// The same walk, stamped with a new sequence number and signed afresh.
@@ -191,23 +179,33 @@ impl Announcement {
     /// sign it; the walk down to it stands exactly as the nodes above it
     /// signed. Returns `None` for a signer that is not the author, which is
     /// the only thing it could mean.
-    pub fn with_seq<S: Signer>(&self, signer: &S, seq: u64) -> Option<Self> {
-        let author = signer.public_key();
-        if author != self.author() {
+    pub(crate) fn with_seq<S: Signer>(&self, signer: &S, seq: u64) -> Option<Self> {
+        if signer.public_key() != self.author() {
             return None;
         }
-        let mut path = self.path.clone();
-        // The path is never empty, so there is always a last hop.
-        let last = path.len() - 1;
-        let cost = path[last].cost;
-        let signature = signer.sign(&signed_bytes(&path[..last], author, cost, seq));
-        path[last] = Hop {
-            key: author,
+        let mut above = self.path.clone();
+        // The author's own hop is the one being restamped, and there is always
+        // one to take: `author` above just read it.
+        let own = above.pop()?;
+        Some(Self::signed_onto(signer, above, own.cost, seq))
+    }
+
+    /// The walk `above`, with `signer`'s node signed onto the end of it at a
+    /// link costing `cost`.
+    ///
+    /// The only place a hop is ever made, so that the three ways of arriving
+    /// at an announcement — rooting, extending, restamping — cannot drift
+    /// apart in what they put their name to.
+    fn signed_onto<S: Signer>(signer: &S, mut above: Vec<Hop>, cost: u64, seq: u64) -> Self {
+        let key = signer.public_key();
+        let signature = signer.sign(&signed_bytes(&above, key, cost, seq));
+        above.push(Hop {
+            key,
             cost,
             seq,
             signature,
-        };
-        Some(Self { path })
+        });
+        Self { path: above }
     }
 
     /// Whether every hop was signed by the node it names.
@@ -271,7 +269,7 @@ impl Announcement {
     /// Comparing whole announcements would say yes every time anybody above
     /// reissued, and a node would spend its life announcing that nothing had
     /// changed.
-    pub fn same_position(&self, other: &Self) -> bool {
+    pub(crate) fn same_position(&self, other: &Self) -> bool {
         self.path.len() == other.path.len()
             && std::iter::zip(&self.path, &other.path)
                 .all(|(here, there)| here.key == there.key && here.cost == there.cost)
@@ -283,7 +281,7 @@ impl Announcement {
     /// author this set is a max register: the join is whichever announcement is
     /// greater. Sequence number decides, with the path as a tie-break purely so
     /// that the rule is total and every node reaches the same answer.
-    pub fn supersedes(&self, other: &Self) -> bool {
+    pub(crate) fn supersedes(&self, other: &Self) -> bool {
         (self.seq(), &self.path) > (other.seq(), &other.path)
     }
 
@@ -305,7 +303,7 @@ impl Announcement {
     /// identically everywhere and the tree has a single fixed point. Two
     /// candidates always differ by the key of some hop before anything a stamp
     /// could reach, so the ordering does not move when a sequence number does.
-    pub fn preference_cmp(&self, other: &Self) -> Ordering {
+    pub(crate) fn preference_cmp(&self, other: &Self) -> Ordering {
         self.root()
             .cmp(&other.root())
             .then_with(|| self.cost_to_root().cmp(&other.cost_to_root()))
@@ -329,7 +327,7 @@ impl Announcement {
 ///
 /// Only keys are compared to find the shared prefix, so two nodes holding
 /// differently stamped copies of the same walk still agree on where it forks.
-pub fn distance(a: &[Hop], b: &[Hop]) -> u64 {
+pub(crate) fn distance(a: &[Hop], b: &[Hop]) -> u64 {
     let shared = a.iter().zip(b).take_while(|(x, y)| x.key == y.key).count();
     // Dropping the shared prefix leaves exactly the hops below the two nodes'
     // common ancestor: the climb from each of them up to it.

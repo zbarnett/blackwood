@@ -39,7 +39,9 @@ impl std::error::Error for SendError {}
 ///
 /// Both are durations in whatever unit the caller counts `now` in. The core
 /// never interprets them and never reads a clock of its own; it only subtracts
-/// one instant it was handed from another.
+/// one instant it was handed from another. That is exactly why there is no
+/// default: a number of its own choosing would be a number in a unit it has no
+/// way of knowing, so every [`Node`] is handed one and somebody chose it.
 ///
 /// `refresh` must be comfortably smaller than `expiry`. A node's announcement
 /// has to be reissued several times over before its peers would otherwise give
@@ -60,7 +62,11 @@ pub struct Timing {
 impl Timing {
     /// Ironwood's choice — reissue every second, forget after three — for a
     /// caller counting in milliseconds.
-    pub const DEFAULT: Self = Self {
+    ///
+    /// Named for the unit rather than for being usual, since the numbers mean
+    /// nothing without it: a caller counting in seconds that reached for this
+    /// would be asking to forget nothing for the best part of an hour.
+    pub const MILLISECONDS: Self = Self {
         refresh: 1_000,
         expiry: 3_000,
     };
@@ -133,14 +139,10 @@ impl<S: Signer> Node<S> {
     /// Creates an isolated node, which necessarily believes it is its own root.
     ///
     /// Its address is whatever key `signer` speaks for, so an identity and the
-    /// means of proving it arrive together and cannot come apart.
-    pub fn new(now: u64, signer: S) -> Self {
-        Self::with_timing(now, signer, Timing::DEFAULT)
-    }
-
-    /// Creates an isolated node that keeps and reissues state on its own
-    /// schedule rather than [`Timing::DEFAULT`].
-    pub fn with_timing(now: u64, signer: S, timing: Timing) -> Self {
+    /// means of proving it arrive together and cannot come apart. `timing` says
+    /// how long state lives, counted in the same unit as `now` — see [`Timing`]
+    /// for why the core will not pick it.
+    pub fn new(now: u64, signer: S, timing: Timing) -> Self {
         let key = signer.public_key();
         let announcement = Announcement::root_of(&signer, 0);
         Self {
@@ -596,24 +598,25 @@ impl<S: Signer> Node<S> {
 
     /// Works out what to say over each tree link, and says it where it changed.
     fn resummarise(&mut self, out: &mut Vec<Envelope>) {
-        let wanted: Vec<(PublicKey, Option<Summary>)> = self
+        // Every link is decided before any is written back, because deciding
+        // one means reading all the others and no link can be held mutably
+        // while that happens. One entry per peer, in the order they iterate.
+        let wanted: Vec<Option<Summary>> = self
             .peers
             .keys()
             .map(|&peer| {
-                let summary = self
-                    .is_tree_neighbour(peer)
-                    .then(|| self.summary_beyond(peer));
-                (peer, summary)
+                self.is_tree_neighbour(peer)
+                    .then(|| self.summary_beyond(peer))
             })
             .collect();
-        for (peer, summary) in wanted {
-            let Some(state) = self.peers.get_mut(&peer) else {
-                continue;
-            };
+        for ((&peer, state), summary) in self.peers.iter_mut().zip(wanted) {
             if state.told == summary {
                 continue;
             }
             state.told = summary;
+            // A link that has just left the tree is told nothing rather than
+            // told it holds nothing: the far end works out the same thing from
+            // its own side and stops summarising back.
             if let Some(summary) = summary {
                 out.push(Envelope {
                     to: peer,
@@ -737,7 +740,7 @@ mod tests {
     /// A node linked to a peer holding a smaller key, having just heard where
     /// that peer sits, so it has taken up a position below it.
     fn node_below_a_peer(now: u64) -> Node<StandIn> {
-        let mut node = Node::new(0, signer(2));
+        let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
         node.add_peer(0, key(1), Cost::UNIT);
         node.handle(now, key(1), announce(1, &[]));
         node
@@ -746,7 +749,7 @@ mod tests {
     /// The middle of the line `1 - 2 - 3`: the root above, one child below,
     /// and the child claiming that 3 and 7 lie beyond it.
     fn middle_of_a_line() -> Node<StandIn> {
-        let mut node = Node::new(0, signer(2));
+        let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
         node.add_peer(0, key(1), Cost::UNIT);
         node.add_peer(0, key(3), Cost::UNIT);
         node.handle(0, key(1), announce(1, &[]));
@@ -764,7 +767,7 @@ mod tests {
 
     #[test]
     fn a_new_node_is_its_own_root() {
-        let node = Node::new(0, signer(7));
+        let node = Node::new(0, signer(7), Timing::MILLISECONDS);
         assert_eq!(node.key(), key(7), "its address is what it signs as");
         assert_eq!(node.root(), key(7));
         assert_eq!(node.parent(), None);
@@ -783,7 +786,7 @@ mod tests {
 
     #[test]
     fn adding_a_peer_tells_it_where_this_node_sits() {
-        let mut node = Node::new(0, signer(2));
+        let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
         let out = node.add_peer(0, key(1), Cost::UNIT);
         assert_eq!(out.len(), 1, "its own position, and nothing else");
         assert_eq!(out[0].to, key(1));
@@ -795,14 +798,14 @@ mod tests {
 
     #[test]
     fn a_node_will_not_peer_with_itself() {
-        let mut node = Node::new(0, signer(1));
+        let mut node = Node::new(0, signer(1), Timing::MILLISECONDS);
         assert!(node.add_peer(0, key(1), Cost::UNIT).is_empty());
         assert_eq!(node.peers().count(), 0);
     }
 
     #[test]
     fn messages_from_strangers_are_ignored() {
-        let mut node = Node::new(0, signer(2));
+        let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
         assert!(node.handle(0, key(1), announce(1, &[])).is_empty());
         assert_eq!(node.root(), key(2), "the tree did not move");
         assert_eq!(
@@ -822,7 +825,7 @@ mod tests {
 
     #[test]
     fn a_node_keeps_a_smaller_key_than_its_peer() {
-        let mut node = Node::new(0, signer(1));
+        let mut node = Node::new(0, signer(1), Timing::MILLISECONDS);
         node.add_peer(0, key(2), Cost::UNIT);
         node.handle(0, key(2), announce(2, &[]));
 
@@ -838,7 +841,7 @@ mod tests {
         // until something outside it happened to break. Because an
         // announcement carries the whole walk, the question is settled here
         // and now, out of what this node can see on its own.
-        let mut node = Node::new(0, signer(2));
+        let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
         node.add_peer(0, key(3), Cost::UNIT);
         node.handle(0, key(3), announce(1, &[(2, 1), (3, 1)]));
 
@@ -887,7 +890,7 @@ mod tests {
 
     #[test]
     fn a_position_that_does_not_check_out_is_not_believed() {
-        let mut node = Node::new(0, signer(3));
+        let mut node = Node::new(0, signer(3), Timing::MILLISECONDS);
         node.add_peer(0, key(2), Cost::UNIT);
 
         // 2's genuine announcement, with the price of its link to the root
@@ -934,7 +937,7 @@ mod tests {
 
     #[test]
     fn a_stale_announcement_changes_nothing() {
-        let mut node = Node::new(0, signer(2));
+        let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
         node.add_peer(0, key(1), Cost::UNIT);
 
         let fresh = Announcement::root_of(&signer(1), 5);
@@ -946,13 +949,13 @@ mod tests {
 
     #[test]
     fn sending_to_a_node_that_has_not_been_looked_up_fails() {
-        let mut node = Node::new(0, signer(1));
+        let mut node = Node::new(0, signer(1), Timing::MILLISECONDS);
         assert_eq!(node.send(key(9), b"hi".to_vec()), Err(SendError::Unknown));
     }
 
     #[test]
     fn sending_to_oneself_delivers_locally() {
-        let mut node = Node::new(0, signer(1));
+        let mut node = Node::new(0, signer(1), Timing::MILLISECONDS);
         assert_eq!(node.send(key(1), b"hi".to_vec()), Ok(Vec::new()));
         assert_eq!(
             node.take_delivered(),
@@ -1072,7 +1075,7 @@ mod tests {
         // no worse is not the test. Handing the packet over on equal terms is
         // how it comes straight back, and it is only strictness that keeps
         // the distance falling at every hop.
-        let mut node = Node::new(0, signer(2));
+        let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
         node.add_peer(0, key(3), Cost::UNIT);
         node.handle(0, key(3), announce(1, &[(2, 1), (3, 1)]));
         node.handle(0, key(3), found(2, 1, &[(2, 1), (4, 1)]));
@@ -1108,7 +1111,7 @@ mod tests {
         let mut node = node_below_a_peer(0);
         assert_eq!(node.known().count(), 1);
 
-        let out = node.tick(Timing::DEFAULT.expiry);
+        let out = node.tick(Timing::MILLISECONDS.expiry);
 
         assert_eq!(node.known().count(), 0, "the announcement was forgotten");
         assert_eq!(node.root(), key(2), "and with it, the route to the root");
@@ -1118,7 +1121,7 @@ mod tests {
 
     #[test]
     fn a_reissued_announcement_survives() {
-        let expiry = Timing::DEFAULT.expiry;
+        let expiry = Timing::MILLISECONDS.expiry;
         let mut node = node_below_a_peer(0);
 
         // The author reissues just before the deadline, one sequence number on.
@@ -1135,7 +1138,7 @@ mod tests {
 
     #[test]
     fn a_repeat_does_not_restart_the_expiry_clock() {
-        let expiry = Timing::DEFAULT.expiry;
+        let expiry = Timing::MILLISECONDS.expiry;
         let mut node = node_below_a_peer(0);
 
         // The same announcement over again, rather than a newer one.
@@ -1155,13 +1158,13 @@ mod tests {
 
     #[test]
     fn a_looked_up_position_is_forgotten_like_any_other() {
-        let mut node = Node::new(0, signer(5));
+        let mut node = Node::new(0, signer(5), Timing::MILLISECONDS);
         node.add_peer(0, key(2), Cost::UNIT);
         node.handle(0, key(2), announce(1, &[(2, 1)]));
         node.handle(0, key(2), found(5, 1, &[(2, 1), (4, 1)]));
         assert!(node.known().any(|known| known == key(4)));
 
-        node.tick(Timing::DEFAULT.expiry);
+        node.tick(Timing::MILLISECONDS.expiry);
 
         assert!(
             !node.known().any(|known| known == key(4)),
@@ -1176,8 +1179,8 @@ mod tests {
 
     #[test]
     fn a_node_reissues_its_own_announcement_on_schedule() {
-        let refresh = Timing::DEFAULT.refresh;
-        let mut node = Node::new(0, signer(1));
+        let refresh = Timing::MILLISECONDS.refresh;
+        let mut node = Node::new(0, signer(1), Timing::MILLISECONDS);
         node.add_peer(0, key(2), Cost::UNIT);
 
         assert!(node.tick(refresh - 1).is_empty(), "not due yet");
@@ -1195,7 +1198,7 @@ mod tests {
 
     #[test]
     fn a_node_that_starts_over_is_believed_once_the_old_one_has_expired() {
-        let expiry = Timing::DEFAULT.expiry;
+        let expiry = Timing::MILLISECONDS.expiry;
         let mut node = node_below_a_peer(0);
 
         // The peer had climbed to a high sequence number before it went quiet.
@@ -1219,12 +1222,12 @@ mod tests {
     }
 
     #[test]
-    fn a_node_with_a_custom_schedule_keeps_to_it() {
+    fn a_node_keeps_to_the_schedule_it_was_given() {
         let timing = Timing {
             refresh: 10,
             expiry: 40,
         };
-        let mut node = Node::with_timing(0, signer(2), timing);
+        let mut node = Node::new(0, signer(2), timing);
         node.add_peer(0, key(1), Cost::UNIT);
         node.handle(0, key(1), announce(1, &[]));
 
@@ -1236,7 +1239,7 @@ mod tests {
 
     #[test]
     fn a_node_sits_below_whichever_peer_offers_the_cheapest_walk_to_the_root() {
-        let mut node = Node::new(0, signer(4));
+        let mut node = Node::new(0, signer(4), Timing::MILLISECONDS);
         node.add_peer(0, key(1), cost(10));
         node.add_peer(0, key(2), cost(1));
         node.handle(0, key(1), announce(1, &[]));
@@ -1254,7 +1257,7 @@ mod tests {
 
     #[test]
     fn re_pricing_a_link_moves_a_node() {
-        let mut node = Node::new(0, signer(4));
+        let mut node = Node::new(0, signer(4), Timing::MILLISECONDS);
         node.add_peer(0, key(1), Cost::UNIT);
         node.add_peer(0, key(2), Cost::UNIT);
         node.handle(0, key(1), announce(1, &[]));
@@ -1347,7 +1350,7 @@ mod tests {
     /// A node holding key 5, linked to both 2 and 3 — each of them a child of
     /// the root — and told that 4 sits below 2, away from 3.
     fn node_choosing_between_two_peers(to_two: u64, to_three: u64) -> Node<StandIn> {
-        let mut node = Node::new(0, signer(5));
+        let mut node = Node::new(0, signer(5), Timing::MILLISECONDS);
         node.add_peer(0, key(2), cost(to_two));
         node.add_peer(0, key(3), cost(to_three));
         node.handle(0, key(2), announce(1, &[(2, 1)]));

@@ -218,7 +218,8 @@ impl Sim {
         let key = signer.key();
         self.keys.insert(id, key);
         self.ids.insert(key, id);
-        self.nodes.insert(id, Node::new(self.now, signer));
+        self.nodes
+            .insert(id, Node::new(self.now, signer, Timing::MILLISECONDS));
     }
 
     /// Removes a node and every link it held.
@@ -286,7 +287,7 @@ impl Sim {
     /// go, because a jump would look to every node as though the whole network
     /// had fallen silent for the entire interval.
     pub fn advance(&mut self, by: u64) {
-        let step = Timing::DEFAULT.refresh.max(1);
+        let step = Timing::MILLISECONDS.refresh.max(1);
         let before = self.total_known();
         let target = self.now.saturating_add(by);
         while self.now < target {

@@ -105,8 +105,11 @@ no panics: a node is a state machine whose every effect is the messages it hands
 back and whose every input — a message, a link coming or going, the passage of
 time — is an argument to a method. Even expiry reads no clock; `Node::tick` is
 handed the current instant by its caller, in whatever unit that caller counts
-in. That is what makes a network of them deterministically simulatable, and what
-should make the argument above tractable to check in a proof assistant.
+in, and the schedule state is kept on comes from the caller too, for the same
+reason the signing algorithm does: a number the core picked would be a number in
+a unit it has no way of knowing. That is what makes a network of them
+deterministically simulatable, and what should make the argument above tractable
+to check in a proof assistant.
 
 Two things ironwood does are left out, both hardening rather than part of the
 model: a parent does not sign for its children, so a node can claim to sit below
