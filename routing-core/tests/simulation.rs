@@ -8,8 +8,8 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use routing_core::{
-    Cost, Hop, KEY_LEN, Message, Node, Packet, PublicKey, SIGNATURE_LEN, SendError, Signature,
-    Signer, Timing,
+    Cost, Hop, KEY_LEN, Message, NONCE_LEN, Node, Nonce, Packet, PublicKey, SIGNATURE_LEN,
+    SendError, Signature, Signer, Timing,
 };
 
 fn key(n: u8) -> PublicKey {
@@ -94,6 +94,10 @@ struct Network {
     searched: Vec<PublicKey>,
     /// The clock every node shares. Only [`Network::advance`] moves it.
     now: u64,
+    /// Counts off the numbers searches go out with. A real caller would take
+    /// these from the operating system; a simulation only needs them to
+    /// differ from one another.
+    nonces: u64,
 }
 
 impl Network {
@@ -107,6 +111,7 @@ impl Network {
             hops: 0,
             searched: Vec::new(),
             now: 0,
+            nonces: 0,
         }
     }
 
@@ -197,7 +202,11 @@ impl Network {
     /// Asks the network where `dst` sits on `src`'s behalf, and reports which
     /// nodes the search passed through.
     fn find(&mut self, src: PublicKey, dst: PublicKey) -> Vec<PublicKey> {
-        let outbound = self.node(src).lookup(dst);
+        self.nonces += 1;
+        let mut bytes = [0; NONCE_LEN];
+        bytes[..8].copy_from_slice(&self.nonces.to_be_bytes());
+        let (now, nonce) = (self.now, Nonce::new(bytes));
+        let outbound = self.node_mut(src).lookup(now, dst, nonce);
         self.searched.clear();
         self.enqueue(src, outbound);
         self.run();

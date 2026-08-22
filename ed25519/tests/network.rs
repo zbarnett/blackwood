@@ -9,8 +9,8 @@ use std::collections::{BTreeMap, VecDeque};
 
 use blackwood_ed25519::Ed25519;
 use routing_core::{
-    Announcement, Cost, MalformedAnnouncement, Message, Node, Packet, PublicKey, SIGNATURE_LEN,
-    Signature, Signer, Timing,
+    Announcement, Consent, Cost, MalformedAnnouncement, Message, NONCE_LEN, Node, Nonce, Packet,
+    PublicKey, SIGNATURE_LEN, Signature, Signer, Timing,
 };
 
 /// A message in flight, from one node to a linked peer.
@@ -23,6 +23,9 @@ struct InFlight {
 struct Network {
     nodes: BTreeMap<PublicKey, Node<Ed25519>>,
     queue: VecDeque<InFlight>,
+    /// Counts off the numbers searches go out with, since a real caller takes
+    /// these from the operating system and a test has none.
+    nonces: u64,
 }
 
 impl Network {
@@ -32,6 +35,7 @@ impl Network {
         let mut net = Self {
             nodes: BTreeMap::new(),
             queue: VecDeque::new(),
+            nonces: 0,
         };
         let keys = (1..=count)
             .map(|seed| {
@@ -86,8 +90,16 @@ impl Network {
     }
 
     /// Asks where `dst` sits on `src`'s behalf, then sends one packet to it.
+    fn nonce(&mut self) -> Nonce {
+        self.nonces += 1;
+        let mut bytes = [0; NONCE_LEN];
+        bytes[..8].copy_from_slice(&self.nonces.to_be_bytes());
+        Nonce::new(bytes)
+    }
+
     fn send(&mut self, src: PublicKey, dst: PublicKey, payload: &[u8]) {
-        let lookup = self.node(src).lookup(dst);
+        let nonce = self.nonce();
+        let lookup = self.node_mut(src).lookup(0, dst, nonce);
         self.enqueue(src, lookup);
         self.run();
 
@@ -193,8 +205,10 @@ fn a_position_nobody_signed_for_is_refused() {
     // place a node speaks about somebody else: Mallory builds a walk of her
     // own and writes the victim's name on the end of it.
     let mallory = Ed25519::from_seed([200; 32]);
+    let accomplice = Ed25519::from_seed([201; 32]);
+    let consent = Consent::issue(&mallory, accomplice.key(), Cost::UNIT);
     let mut impersonated = Announcement::root_of(&mallory, 0)
-        .extend(&Ed25519::from_seed([201; 32]), Cost::UNIT, 0)
+        .extend(&accomplice, &consent, 0)
         .expect("distinct keys")
         .path()
         .to_vec();
@@ -203,6 +217,56 @@ fn a_position_nobody_signed_for_is_refused() {
         Announcement::new::<Ed25519>(impersonated),
         Err(MalformedAnnouncement::BadSignature),
         "a hop is only worth what the node it names signed for"
+    );
+}
+
+#[test]
+fn a_node_cannot_sign_itself_onto_a_walk_it_has_no_link_to() {
+    // The splice: Mallory holds somebody else's genuine announcement — a
+    // search's answer carries one, so anybody can have any node's — and signs
+    // herself onto the end of it over a link costing one. Every signature
+    // above her is real and her own hop is signed properly. What she cannot
+    // produce is the other end of the bargain.
+    let (net, keys) = ring_with_a_tail();
+    let root = net.node(keys[0]).root();
+    let mallory = Ed25519::from_seed([200; 32]);
+
+    let stolen = Announcement::new::<Ed25519>(net.node(root).path().to_vec()).expect("genuine");
+
+    // The constructor will not build it: a consent she signed herself is not
+    // the root agreeing to carry her, and it names both ends so she cannot
+    // pass it off as one.
+    let her_own = Consent::issue(&mallory, mallory.key(), Cost::UNIT);
+    assert_eq!(stolen.extend(&mallory, &her_own, 1), None);
+
+    // Nor by borrowing one the root really did issue, to somebody else.
+    let elsewhere = Consent::issue(&Ed25519::from_seed([1; 32]), mallory.key(), Cost::UNIT);
+    assert_eq!(stolen.extend(&mallory, &elsewhere, 1), None);
+
+    // The walk she is left with is the one she can sign for on her own: her
+    // own, with nobody above her.
+    let alone = Announcement::root_of(&mallory, 1);
+    assert_eq!(alone.path().len(), 1);
+    assert_eq!(alone.cost_to_root(), 0);
+
+    // And the one thing she can do — sit below a node that really did agree
+    // to carry her — is not a lie at all, and puts her where the price that
+    // node named says she is, not where she would like to be.
+    let (mut net, keys) = ring_with_a_tail();
+    let host = keys[0];
+    net.nodes.insert(
+        mallory.key(),
+        Node::new(0, Ed25519::from_seed([200; 32]), Timing::MILLISECONDS),
+    );
+    net.link(host, mallory.key(), Cost::new(5).expect("not zero"));
+    net.run();
+
+    let path = net.node(mallory.key()).path();
+    assert_eq!(path[path.len() - 1].cost, 5, "the price her host named");
+    assert!(path.len() > 1, "a position she was actually offered");
+    assert!(
+        Announcement::new::<Ed25519>(path.to_vec()).is_ok(),
+        "and one that checks out end to end"
     );
 }
 

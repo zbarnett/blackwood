@@ -5,10 +5,10 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::key::PublicKey;
-use crate::message::{Envelope, Found, Lookup, Message, Packet, Traffic};
+use crate::message::{Envelope, Found, Lookup, Message, Nonce, Packet, Traffic};
 use crate::signature::Signer;
 use crate::summary::Summary;
-use crate::tree::{Announcement, Cost, Hop, distance};
+use crate::tree::{Announcement, Consent, Cost, Hop, distance};
 
 /// Why a packet could not be handed to the network.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -34,6 +34,81 @@ impl fmt::Display for SendError {
 }
 
 impl std::error::Error for SendError {}
+
+/// Something a peer said that no honest node could have said.
+///
+/// These are not disagreements. A node whose view is out of date says wrong
+/// things constantly and that is what soft state is for; every fault here is
+/// either a signature that does not check out or a message that no
+/// implementation of this protocol would ever send. Nothing an honest peer
+/// does under any timing, any topology change, or any amount of staleness
+/// produces one — which is what makes acting on them safe. A rule that fired
+/// on stale routing state instead would be a way for one node to make two
+/// others drop each other.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Fault {
+    /// An announcement about somebody other than the peer that sent it.
+    ///
+    /// Announcements cross one link and describe their sender. Relaying one is
+    /// not a thing this protocol does.
+    AnnouncementAboutAnother,
+    /// An announcement with a hop that was not signed by the node it names, or
+    /// that sits on a consent that node never gave.
+    ForgedAnnouncement,
+    /// A consent that was not this peer agreeing to carry this node.
+    MisdirectedConsent,
+    /// An answer to a search that its own subject did not vouch for.
+    ///
+    /// Every node on an answer's way home checks it before passing it on, so
+    /// an answer that does not hold together cannot have travelled: whoever
+    /// handed this one over is where it was made up.
+    ForgedAnswer,
+}
+
+impl fmt::Display for Fault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AnnouncementAboutAnother => f.write_str("announced a position for another node"),
+            Self::ForgedAnnouncement => f.write_str("announced a position nobody signed for"),
+            Self::MisdirectedConsent => f.write_str("gave a consent meant for somebody else"),
+            Self::ForgedAnswer => f.write_str("answered a search with something unsigned"),
+        }
+    }
+}
+
+/// A peer dropped for committing a [`Fault`], and what it did.
+///
+/// The routing state is gone by the time a caller sees this — the node stops
+/// forwarding to the peer, stops sitting below it, and stops summarising over
+/// the link, all before returning. The link itself belongs to whoever brought
+/// it up, which is why this is reported as well as acted on: closing the
+/// socket, refusing the next handshake, or deciding it was a bad build and
+/// bringing it back are all the caller's to make.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Eviction {
+    /// The peer that was dropped.
+    pub peer: PublicKey,
+    /// What it did.
+    pub fault: Fault,
+}
+
+impl fmt::Display for Eviction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:?} {}", self.peer, self.fault)
+    }
+}
+
+/// What became of an announcement handed to [`Node::remember`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Remembered {
+    /// Taken up: it was news, and it checked out.
+    Stored,
+    /// Set aside, and nobody is at fault: this node is its author, or it is a
+    /// repeat or an older copy of something already held.
+    Ignored,
+    /// Refused, and whoever sent it is at fault.
+    Forged,
+}
 
 /// How long announcements live, and how often a node renews its own.
 ///
@@ -98,6 +173,23 @@ struct Peer {
     /// nothing because the link is not part of the tree. Keeping it is what
     /// lets a node speak only when something has changed, and so fall quiet.
     told: Option<Summary>,
+    /// The peer's agreement that this node may sit below it, and at what
+    /// price, or `None` while none has arrived. Without one this node cannot
+    /// take up a position below the peer at all, however attractive it looks.
+    consent: Option<Consent>,
+}
+
+/// A search this node has asked and not yet had an answer to.
+///
+/// Keeping it is what tells an answer from an assertion. Without it any peer
+/// could push positions into this node unbidden, and the map they land in is
+/// the one thing here that grows with use.
+#[derive(Clone, Copy, Debug)]
+struct Pending {
+    /// The node being looked for.
+    target: PublicKey,
+    /// When the search went out, so that unanswered ones do not accumulate.
+    asked_at: u64,
 }
 
 /// One node's complete routing state.
@@ -132,7 +224,11 @@ pub struct Node<S> {
     /// Where other nodes sit: every peer, since a peer announces itself across
     /// the link, and whoever else has been looked up and not yet forgotten.
     infos: BTreeMap<PublicKey, Info>,
+    /// The searches this node has outstanding, by the nonce each went out
+    /// with. Expiry bounds it exactly as it bounds `infos`.
+    pending: BTreeMap<Nonce, Pending>,
     delivered: Vec<Packet>,
+    evicted: Vec<Eviction>,
 }
 
 impl<S: Signer> Node<S> {
@@ -153,7 +249,9 @@ impl<S: Signer> Node<S> {
             announced_at: now,
             peers: BTreeMap::new(),
             infos: BTreeMap::new(),
+            pending: BTreeMap::new(),
             delivered: Vec::new(),
+            evicted: Vec::new(),
         }
     }
 
@@ -222,6 +320,11 @@ impl<S: Signer> Node<S> {
         let expiry = self.timing.expiry;
         self.infos
             .retain(|_, info| now.saturating_sub(info.heard_at) < expiry);
+        // A search nobody answered is forgotten on the same schedule. Its
+        // answer arriving afterwards is not an answer any more, which costs
+        // the asker a question it was free to ask again.
+        self.pending
+            .retain(|_, asked| now.saturating_sub(asked.asked_at) < expiry);
         self.settle(now, &mut out);
         if now.saturating_sub(self.announced_at) >= self.timing.refresh {
             // The same walk over again, freshly stamped and signed. What stops
@@ -237,9 +340,10 @@ impl<S: Signer> Node<S> {
 
     /// Brings up a link to `peer`, costing `cost` to cross.
     ///
-    /// The peer is told where this node sits, and nothing else: that is all it
-    /// needs in order to decide whether to sit below this one, and it learns
-    /// the rest of the network the way anybody does, by asking.
+    /// The peer is told where this node sits and given leave to sit below it
+    /// at `cost`, and nothing else: that is all it needs in order to decide
+    /// whether to, and it learns the rest of the network the way anybody does,
+    /// by asking.
     ///
     /// Calling this for a link that is already up re-prices it instead, which
     /// is how a caller that keeps measuring its links reports what it found.
@@ -262,6 +366,7 @@ impl<S: Signer> Node<S> {
                         cost,
                         beyond: Summary::new(),
                         told: None,
+                        consent: None,
                     },
                 );
                 out.push(Envelope {
@@ -270,6 +375,15 @@ impl<S: Signer> Node<S> {
                 });
             }
         }
+        // Either way the peer is owed this node's agreement to carry it, at
+        // the price this node has just put on the link. A re-priced link is a
+        // different bargain, so the old consent is withdrawn by being
+        // replaced: the peer cannot go on announcing the old number, because
+        // the number is part of what was signed.
+        out.push(Envelope {
+            to: peer,
+            message: Message::Consent(Consent::issue(&self.signer, peer, cost)),
+        });
         self.settle(now, &mut out);
         out
     }
@@ -302,8 +416,9 @@ impl<S: Signer> Node<S> {
                 self.receive_announce(now, from, announcement, &mut out)
             }
             Message::Summary(summary) => self.receive_summary(now, from, summary, &mut out),
+            Message::Consent(consent) => self.receive_consent(now, from, consent, &mut out),
             Message::Lookup(lookup) => self.receive_lookup(from, lookup, &mut out),
-            Message::Found(found) => self.receive_found(now, found, &mut out),
+            Message::Found(found) => self.receive_found(now, from, found, &mut out),
             Message::Traffic(traffic) => self.forward(traffic, &mut out),
         }
         out
@@ -343,20 +458,38 @@ impl<S: Signer> Node<S> {
     /// search a detour and nothing more.
     ///
     /// The answer arrives later, as a message like any other, and is what makes
-    /// a subsequent [`send`](Self::send) to `target` work. Nothing is recorded
-    /// about the asking, so a search that finds nothing simply goes unanswered
-    /// and this node is free to ask again.
-    pub fn lookup(&self, target: PublicKey) -> Vec<Envelope> {
+    /// a subsequent [`send`](Self::send) to `target` work.
+    ///
+    /// `nonce` must be fresh and unguessable, and comes from the caller for the
+    /// same reason `now` does: this crate touches no operating system and so
+    /// has no randomness of its own. The node being looked for signs it, which
+    /// is the only part of an answer that a recording of an older one cannot
+    /// supply — a signature says who, and the nonce is what makes it say when.
+    /// The search is remembered until it is answered or expires, so an answer
+    /// nobody asked for is not mistaken for one.
+    ///
+    /// A search that finds nothing simply goes unanswered, and this node is
+    /// free to ask again with a new nonce.
+    pub fn lookup(&mut self, now: u64, target: PublicKey, nonce: Nonce) -> Vec<Envelope> {
         let mut out = Vec::new();
-        if target != self.key {
-            self.search(
-                &Lookup {
-                    target,
-                    trail: vec![self.key],
-                },
-                &mut out,
-            );
+        if target == self.key {
+            return out;
         }
+        self.pending.insert(
+            nonce,
+            Pending {
+                target,
+                asked_at: now,
+            },
+        );
+        self.search(
+            &Lookup {
+                target,
+                nonce,
+                trail: vec![self.key],
+            },
+            &mut out,
+        );
         out
     }
 
@@ -365,46 +498,100 @@ impl<S: Signer> Node<S> {
         std::mem::take(&mut self.delivered)
     }
 
+    /// Takes the peers dropped for misbehaving since this was last asked.
+    ///
+    /// The routing state is already gone: a node evicts a peer the moment it
+    /// catches it, in the same call that caught it, and the envelopes that
+    /// call returns are the network being told about the hole. What is left
+    /// for the caller is the link itself, which the core never held — see
+    /// [`Eviction`].
+    pub fn take_evicted(&mut self) -> Vec<Eviction> {
+        std::mem::take(&mut self.evicted)
+    }
+
+    /// The consent this node holds from `peer`, if any has arrived.
+    ///
+    /// It is what lets this node sit below that peer, and the price in it is
+    /// the one its own hop would carry. `None` means the peer has not yet
+    /// agreed to carry this node, which is a position it cannot take up.
+    pub fn consent_from(&self, peer: PublicKey) -> Option<Consent> {
+        self.peers.get(&peer).and_then(|state| state.consent)
+    }
+
     /// What this node last heard about `key`, if it still holds it.
     fn info(&self, key: &PublicKey) -> Option<&Announcement> {
         self.infos.get(key).map(|info| &info.announcement)
     }
 
-    /// Takes note of where another node says it sits, reporting whether it was
-    /// news.
+    /// Whether an announcement is worth looking at twice: not this node's own,
+    /// and not something already held in a form that supersedes it.
     ///
     /// Only news restarts the expiry clock. A repeat of a position already held
     /// is not evidence its author is still there, and treating it as such would
     /// let an echo keep a dead node alive.
-    fn remember(&mut self, now: u64, announcement: Announcement) -> bool {
-        let author = announcement.author();
+    fn is_news(&self, announcement: &Announcement) -> bool {
         // A node is the only authority on where it sits, so anything arriving
         // about this one is at best a stale echo of its own.
-        if author == self.key {
-            return false;
+        announcement.author() != self.key
+            && !self
+                .info(&announcement.author())
+                .is_some_and(|known| !announcement.supersedes(known))
+    }
+
+    /// Takes note of where another node says it sits, saying what became of it.
+    ///
+    /// Everything that enters here came off a link, so this is where a forgery
+    /// stops: each hop has to be signed by the node it names and agreed to by
+    /// the node above it, which no amount of relaying can arrange for a node
+    /// that never sat there. Cheaper questions are asked first, but nothing is
+    /// kept or acted on until this one is answered.
+    fn remember(&mut self, now: u64, announcement: Announcement) -> Remembered {
+        if !self.is_news(&announcement) {
+            return Remembered::Ignored;
         }
-        if self
-            .info(&author)
-            .is_some_and(|known| !announcement.supersedes(known))
-        {
-            return false;
-        }
-        // Everything that enters here came off a link, so this is where a
-        // forgery stops: each hop has to be signed by the node it names, which
-        // no amount of relaying can arrange for a node that never sat there.
-        // Cheaper questions are asked first, but nothing is kept or acted on
-        // until this one is answered.
         if !announcement.verify::<S>() {
-            return false;
+            return Remembered::Forged;
         }
+        self.keep(now, announcement);
+        Remembered::Stored
+    }
+
+    /// The same, for an announcement whose signatures the caller has already
+    /// checked — which the answer to a search has, on every hop of its way
+    /// home. Reports whether it was news.
+    fn remember_checked(&mut self, now: u64, announcement: Announcement) -> bool {
+        let news = self.is_news(&announcement);
+        if news {
+            self.keep(now, announcement);
+        }
+        news
+    }
+
+    /// Files an announcement that has passed everything.
+    fn keep(&mut self, now: u64, announcement: Announcement) {
         self.infos.insert(
-            author,
+            announcement.author(),
             Info {
                 announcement,
                 heard_at: now,
             },
         );
-        true
+    }
+
+    /// Drops a peer that has said something no honest node could say, and
+    /// notes it for the caller to find with [`take_evicted`](Self::take_evicted).
+    ///
+    /// Everything the peer was holding up goes with it: this node stops
+    /// forwarding to it, stops sitting below it if it was the parent, and
+    /// stops summarising over the link, all of which `settle` says out loud.
+    /// What it learned *through* the peer is left to expire, exactly as
+    /// [`remove_peer`](Self::remove_peer) leaves it.
+    fn evict(&mut self, now: u64, peer: PublicKey, fault: Fault, out: &mut Vec<Envelope>) {
+        if self.peers.remove(&peer).is_none() {
+            return;
+        }
+        self.evicted.push(Eviction { peer, fault });
+        self.settle(now, out);
     }
 
     fn receive_announce(
@@ -416,13 +603,46 @@ impl<S: Signer> Node<S> {
     ) {
         // An announcement crosses exactly one link and describes whoever sent
         // it. Nothing relays one, so a node hears about its peers and about
-        // nobody else, which is the whole of what keeps this state constant.
+        // nobody else, which is the whole of what keeps this state constant —
+        // and a peer sending one about anybody else is not a peer running this
+        // protocol.
         if announcement.author() != from {
+            self.evict(now, from, Fault::AnnouncementAboutAnother, out);
             return;
         }
-        if self.remember(now, announcement) {
-            self.settle(now, out);
+        match self.remember(now, announcement) {
+            Remembered::Stored => self.settle(now, out),
+            Remembered::Ignored => {}
+            Remembered::Forged => self.evict(now, from, Fault::ForgedAnnouncement, out),
         }
+    }
+
+    fn receive_consent(
+        &mut self,
+        now: u64,
+        from: PublicKey,
+        consent: Consent,
+        out: &mut Vec<Envelope>,
+    ) {
+        // A consent names both ends, so one meant for somebody else — or
+        // coming from somebody other than the node that signed it — is not a
+        // thing an honest peer would hand over. Its signature needs no
+        // checking here: a `Consent` cannot be built without one that checks
+        // out, so the only question left is who it is between.
+        if consent.parent() != from || consent.child() != self.key {
+            self.evict(now, from, Fault::MisdirectedConsent, out);
+            return;
+        }
+        let Some(state) = self.peers.get_mut(&from) else {
+            return;
+        };
+        // Only a change is worth working through, the same as a summary: a
+        // peer reissuing the bargain it already offered ends here.
+        if state.consent == Some(consent) {
+            return;
+        }
+        state.consent = Some(consent);
+        self.settle(now, out);
     }
 
     fn receive_summary(
@@ -452,12 +672,17 @@ impl<S: Signer> Node<S> {
             return;
         }
         if lookup.target == self.key {
+            // Signing the search's own nonce is what makes this evidence
+            // rather than a claim: the walk below is as old as its signatures
+            // allow, but nobody could have produced this part in advance.
             out.push(Envelope {
                 to: from,
-                message: Message::Found(Found {
-                    announcement: self.announcement.clone(),
-                    trail: lookup.trail,
-                }),
+                message: Message::Found(Found::answer(
+                    &self.signer,
+                    self.announcement.clone(),
+                    lookup.nonce,
+                    lookup.trail,
+                )),
             });
             return;
         }
@@ -465,7 +690,13 @@ impl<S: Signer> Node<S> {
         self.search(&lookup, out);
     }
 
-    fn receive_found(&mut self, now: u64, mut found: Found, out: &mut Vec<Envelope>) {
+    fn receive_found(
+        &mut self,
+        now: u64,
+        from: PublicKey,
+        mut found: Found,
+        out: &mut Vec<Envelope>,
+    ) {
         // The trail is the way home and this node should be standing on the end
         // of it. Anything else is the answer to a search that never came
         // through here, and this node is not on its way anywhere.
@@ -473,15 +704,44 @@ impl<S: Signer> Node<S> {
             return;
         }
         match found.trail.last() {
-            Some(&back) if self.peers.contains_key(&back) => out.push(Envelope {
-                to: back,
-                message: Message::Found(found),
-            }),
-            // The trail is spent, so this node is the one that asked. An answer
-            // is trusted exactly as an announcement is: with signatures it
-            // could not be forged, and without them it is taken on faith.
+            // Somebody else asked, and this node is a step on the way back.
+            // Nothing is passed on unchecked, which is what makes the check
+            // worth acting on: every node between the answer and its asker
+            // asks the same question, so one that does not hold together
+            // cannot have travelled, and whoever handed it over made it up.
+            Some(&back) if self.peers.contains_key(&back) => {
+                if !found.verify::<S>() {
+                    self.evict(now, from, Fault::ForgedAnswer, out);
+                    return;
+                }
+                out.push(Envelope {
+                    to: back,
+                    message: Message::Found(found),
+                });
+            }
+            // The trail is spent, so this node is the one that asked — if it
+            // asked at all. An answer to a question nobody here put, or to a
+            // different question than the nonce says, is not an answer, and
+            // recognising that is what stops a peer pushing positions into
+            // this node unbidden. Those cheap questions come first, so that
+            // arriving unbidden costs a signature check nothing.
             None => {
-                self.remember(now, found.announcement);
+                let Some(pending) = self.pending.get(&found.nonce) else {
+                    return;
+                };
+                if pending.target != found.announcement.author() {
+                    return;
+                }
+                if !found.verify::<S>() {
+                    self.evict(now, from, Fault::ForgedAnswer, out);
+                    return;
+                }
+                // Answered, so the question is closed. Asking again means a
+                // new nonce, which is what stops one answer serving twice.
+                self.pending.remove(&found.nonce);
+                if self.remember_checked(now, found.announcement) {
+                    self.settle(now, out);
+                }
             }
             // The link the search came in over has gone down since. Dropping
             // the answer costs the asker a retry it was free to make anyway.
@@ -548,14 +808,23 @@ impl<S: Signer> Node<S> {
     /// The most preferred position available: below some peer, or self-rooted.
     ///
     /// Every candidate is signed as it is built, since a position this node
-    /// cannot sign is not one it could take up.
+    /// cannot sign is not one it could take up — and every candidate below a
+    /// peer needs that peer's consent for the same reason. A node with nowhere
+    /// it is welcome is the root of its own tree, which is where every node
+    /// starts.
     fn best_position(&self, seq: u64) -> Announcement {
         let mut best = Announcement::root_of(&self.signer, seq);
         for (peer, state) in &self.peers {
             let Some(info) = self.info(peer) else {
                 continue;
             };
-            let Some(candidate) = info.extend(&self.signer, state.cost, seq) else {
+            // No consent, no position. The price in it is the peer's, not this
+            // node's, so what a candidate costs to reach is what the node
+            // carrying it said it would cost.
+            let Some(consent) = &state.consent else {
+                continue;
+            };
+            let Some(candidate) = info.extend(&self.signer, consent, seq) else {
                 continue;
             };
             if candidate.preference_cmp(&best) == Ordering::Less {
@@ -681,6 +950,7 @@ impl<S: Signer> Node<S> {
 mod tests {
     use super::*;
     use crate::key::KEY_LEN;
+    use crate::message::NONCE_LEN;
     use crate::stand_in::StandIn;
 
     fn key(n: u8) -> PublicKey {
@@ -696,13 +966,16 @@ mod tests {
     }
 
     /// An announcement for the node at the end of `root` + `steps`, each hop
-    /// signed by the node that added it.
+    /// signed by the node that added it and consented to by the one above.
     fn announcement(root: u8, steps: &[(u8, u64)]) -> Announcement {
         let mut announcement = Announcement::root_of(&signer(root), 0);
+        let mut above = root;
         for &(node, price) in steps {
+            let consent = Consent::issue(&signer(above), key(node), cost(price));
             announcement = announcement
-                .extend(&signer(node), cost(price), 0)
+                .extend(&signer(node), &consent, 0)
                 .expect("the test path holds distinct keys");
+            above = node;
         }
         announcement
     }
@@ -721,12 +994,34 @@ mod tests {
         Message::Announce(announcement(root, steps))
     }
 
-    /// The answer to a search that `here` made itself, arriving back home.
-    fn found(here: u8, root: u8, steps: &[(u8, u64)]) -> Message {
-        Message::Found(Found {
-            announcement: announcement(root, steps),
-            trail: vec![key(here)],
-        })
+    /// `parent` agreeing to carry `child` over a link it prices at `price`.
+    fn consent_from(parent: u8, child: u8, price: u64) -> Message {
+        Message::Consent(Consent::issue(&signer(parent), key(child), cost(price)))
+    }
+
+    fn nonce(n: u8) -> Nonce {
+        Nonce::new([n; NONCE_LEN])
+    }
+
+    /// An answer to a search, signed over `nonce` by the node it describes,
+    /// with `trail` as what is left of its way home.
+    fn answer(seed: u8, trail: &[u8], root: u8, steps: &[(u8, u64)]) -> Message {
+        let announcement = announcement(root, steps);
+        Message::Found(Found::answer(
+            &StandIn::for_key(announcement.author()),
+            announcement,
+            nonce(seed),
+            trail.iter().map(|&n| key(n)).collect(),
+        ))
+    }
+
+    /// The answer to a search `node` really made, arriving back home.
+    ///
+    /// It asks first, because an answer to a question nobody put is not one.
+    fn found(node: &mut Node<StandIn>, root: u8, steps: &[(u8, u64)]) -> Message {
+        let target = announcement(root, steps).author();
+        node.lookup(0, target, nonce(0));
+        answer(0, &[node.key().as_bytes()[0]], root, steps)
     }
 
     fn summary_of(keys: &[u8]) -> Summary {
@@ -742,6 +1037,7 @@ mod tests {
     fn node_below_a_peer(now: u64) -> Node<StandIn> {
         let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
         node.add_peer(0, key(1), Cost::UNIT);
+        node.handle(now, key(1), consent_from(1, 2, 1));
         node.handle(now, key(1), announce(1, &[]));
         node
     }
@@ -752,6 +1048,8 @@ mod tests {
         let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
         node.add_peer(0, key(1), Cost::UNIT);
         node.add_peer(0, key(3), Cost::UNIT);
+        node.handle(0, key(1), consent_from(1, 2, 1));
+        node.handle(0, key(3), consent_from(3, 2, 1));
         node.handle(0, key(1), announce(1, &[]));
         node.handle(0, key(3), announce(1, &[(2, 1), (3, 1)]));
         node.handle(0, key(3), Message::Summary(summary_of(&[3, 7])));
@@ -788,11 +1086,62 @@ mod tests {
     fn adding_a_peer_tells_it_where_this_node_sits() {
         let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
         let out = node.add_peer(0, key(1), Cost::UNIT);
-        assert_eq!(out.len(), 1, "its own position, and nothing else");
-        assert_eq!(out[0].to, key(1));
+        assert_eq!(out.len(), 2, "where it sits, and leave to sit below it");
+        assert!(out.iter().all(|envelope| envelope.to == key(1)));
         assert_eq!(
             out[0].message,
             Message::Announce(Announcement::root_of(&signer(2), 0))
+        );
+        assert_eq!(
+            out[1].message,
+            Message::Consent(Consent::issue(&signer(2), key(1), Cost::UNIT)),
+            "priced at what this node measured, since it is the one carrying"
+        );
+    }
+
+    #[test]
+    fn a_node_will_not_sit_below_a_peer_that_has_not_agreed() {
+        let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
+        node.add_peer(0, key(1), Cost::UNIT);
+        node.handle(0, key(1), announce(1, &[]));
+
+        assert_eq!(node.parent(), None, "a better position, and not on offer");
+        assert_eq!(node.root(), key(2), "so it is still its own root");
+        assert_eq!(node.consent_from(key(1)), None);
+
+        node.handle(0, key(1), consent_from(1, 2, 1));
+        assert_eq!(node.parent(), Some(key(1)), "now it is");
+    }
+
+    #[test]
+    fn a_node_announces_the_price_its_parent_named() {
+        // Both ends measured the link and disagreed about it. What the child
+        // announces is the parent's number, because the parent is the one
+        // that has to carry the traffic — a child free to pick would pick
+        // nothing, and advertise the cheapest walk in the neighbourhood.
+        let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
+        node.add_peer(0, key(1), cost(1));
+        node.handle(0, key(1), consent_from(1, 2, 9));
+        node.handle(0, key(1), announce(1, &[]));
+
+        assert_eq!(node.cost_to_root(), 9, "the parent's price, not its own");
+        assert_eq!(walk(node.path()), [(key(1), 0), (key(2), 9)]);
+    }
+
+    #[test]
+    fn re_pricing_a_link_offers_the_peer_a_new_bargain() {
+        let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
+        node.add_peer(0, key(1), Cost::UNIT);
+
+        let out = node.add_peer(1, key(1), cost(10));
+
+        assert_eq!(
+            out,
+            vec![Envelope {
+                to: key(1),
+                message: Message::Consent(Consent::issue(&signer(2), key(1), cost(10))),
+            }],
+            "the price is part of what was agreed, so it is agreed again"
         );
     }
 
@@ -858,21 +1207,97 @@ mod tests {
         // A search answered with this node's own position, arriving back at
         // it: an echo of something it said, or somebody else's idea of where
         // it belongs. A node is the only authority on that, so either way
-        // there is nothing here to learn.
+        // there is nothing here to learn — and it never asked, which stops it
+        // one step earlier still.
         let mut node = node_below_a_peer(0);
         let before = node.path().to_vec();
 
-        node.handle(
-            1,
-            key(1),
-            Message::Found(Found {
-                announcement: announcement(1, &[(9, 1), (2, 1)]),
-                trail: vec![key(2)],
-            }),
-        );
+        node.handle(1, key(1), answer(0, &[2], 1, &[(9, 1), (2, 1)]));
 
         assert_eq!(node.path(), before, "still where it put itself");
         assert!(!node.known().any(|known| known == key(2)));
+        assert!(node.take_evicted().is_empty(), "and nobody is at fault");
+    }
+
+    #[test]
+    fn an_answer_to_a_question_nobody_asked_is_refused() {
+        // Perfectly signed, and about a node this one would be glad to know
+        // where to find. But nothing here asked, so this is a peer pushing a
+        // position rather than answering for one — and what it is pushing
+        // into is the only thing a node holds that grows with use.
+        let mut node = middle_of_a_line();
+
+        let out = node.handle(0, key(3), answer(0, &[2], 1, &[(2, 1), (3, 1), (7, 1)]));
+
+        assert!(out.is_empty());
+        assert!(!node.known().any(|known| known == key(7)));
+        assert_eq!(node.send(key(7), b"hi".to_vec()), Err(SendError::Unknown));
+    }
+
+    #[test]
+    fn an_answer_to_a_different_question_is_refused() {
+        // The nonce is one this node really is waiting on, and the answer
+        // really is signed. It is just not an answer to what was asked, which
+        // is how a stale position for somebody else would arrive if the nonce
+        // did not tie a question to its answer.
+        let mut node = middle_of_a_line();
+        node.lookup(0, key(7), nonce(0));
+
+        node.handle(0, key(3), answer(0, &[2], 1, &[(2, 1), (3, 1), (9, 1)]));
+
+        assert!(!node.known().any(|known| known == key(9)));
+    }
+
+    #[test]
+    fn an_answer_signed_for_another_search_is_refused() {
+        // The recording of an older answer, replayed at a node that is
+        // waiting on this target. Everything in it checks out except the one
+        // thing that cannot be recorded in advance.
+        let mut node = middle_of_a_line();
+        node.lookup(0, key(7), nonce(1));
+
+        let out = node.handle(0, key(3), answer(0, &[2], 1, &[(2, 1), (3, 1), (7, 1)]));
+
+        assert!(out.is_empty(), "no nonce of this node's matches it");
+        assert!(!node.known().any(|known| known == key(7)));
+    }
+
+    #[test]
+    fn an_answer_serves_the_one_search_that_asked_for_it() {
+        let mut node = middle_of_a_line();
+        node.lookup(0, key(7), nonce(0));
+        node.handle(0, key(3), answer(0, &[2], 1, &[(2, 1), (3, 1), (7, 1)]));
+        assert!(node.known().any(|known| known == key(7)));
+
+        node.tick(Timing::MILLISECONDS.expiry);
+        assert!(!node.known().any(|known| known == key(7)), "it expired");
+
+        // The same answer over again. The question it belonged to is closed,
+        // so replaying it is not a way to keep a position alive.
+        node.handle(
+            Timing::MILLISECONDS.expiry,
+            key(3),
+            answer(0, &[2], 1, &[(2, 1), (3, 1), (7, 1)]),
+        );
+        assert!(!node.known().any(|known| known == key(7)));
+    }
+
+    #[test]
+    fn a_search_nobody_answered_is_forgotten() {
+        let mut node = middle_of_a_line();
+        node.lookup(0, key(7), nonce(0));
+        node.tick(Timing::MILLISECONDS.expiry);
+
+        node.handle(
+            Timing::MILLISECONDS.expiry,
+            key(3),
+            answer(0, &[2], 1, &[(2, 1), (3, 1), (7, 1)]),
+        );
+
+        assert!(
+            !node.known().any(|known| known == key(7)),
+            "an answer this late is to a question no longer being asked"
+        );
     }
 
     #[test]
@@ -886,6 +1311,16 @@ mod tests {
             vec![key(1)],
             "a node hears about its peers and nobody else"
         );
+        assert_eq!(
+            node.take_evicted(),
+            vec![Eviction {
+                peer: key(1),
+                fault: Fault::AnnouncementAboutAnother,
+            }],
+            "and a peer that relays one is not running this protocol"
+        );
+        assert_eq!(node.peers().count(), 0, "so it is not a peer any more");
+        assert_eq!(node.parent(), None, "and nothing sits below it");
     }
 
     #[test]
@@ -908,6 +1343,88 @@ mod tests {
         assert!(out.is_empty());
         assert_eq!(node.known().count(), 0, "nothing was taken on trust");
         assert_eq!(node.parent(), None, "and nothing was sat below");
+        assert_eq!(
+            node.take_evicted(),
+            vec![Eviction {
+                peer: key(2),
+                fault: Fault::ForgedAnnouncement,
+            }],
+            "no honest node produces a walk that does not check out"
+        );
+        assert_eq!(node.peers().count(), 0);
+    }
+
+    #[test]
+    fn a_consent_meant_for_somebody_else_costs_the_peer_its_link() {
+        let mut node = node_below_a_peer(0);
+        node.add_peer(0, key(3), Cost::UNIT);
+
+        // 3 hands over the agreement 1 gave to this node. It checks out
+        // perfectly — it just is not 3 agreeing to carry anybody.
+        node.handle(0, key(3), consent_from(1, 2, 1));
+
+        assert_eq!(
+            node.take_evicted(),
+            vec![Eviction {
+                peer: key(3),
+                fault: Fault::MisdirectedConsent,
+            }]
+        );
+        assert_eq!(node.consent_from(key(3)), None);
+    }
+
+    #[test]
+    fn a_consent_for_another_node_costs_the_peer_its_link() {
+        let mut node = node_below_a_peer(0);
+        node.add_peer(0, key(3), Cost::UNIT);
+
+        // 3 really did sign this, and it really is 3's to give — to 9.
+        node.handle(0, key(3), consent_from(3, 9, 1));
+
+        assert_eq!(
+            node.take_evicted(),
+            vec![Eviction {
+                peer: key(3),
+                fault: Fault::MisdirectedConsent,
+            }]
+        );
+    }
+
+    #[test]
+    fn evicting_a_peer_says_so_to_the_rest() {
+        // The evicted peer was this node's parent, so losing it moves the
+        // node — and every other peer has to hear where it moved to. An
+        // eviction is a link going down, and behaves like one.
+        let mut node = middle_of_a_line();
+        assert_eq!(node.parent(), Some(key(1)));
+
+        let out = node.handle(0, key(1), announce(1, &[(9, 1)]));
+
+        assert_eq!(node.parent(), None, "its parent is gone");
+        assert_eq!(node.root(), key(2));
+        assert_eq!(announces(&out), vec![key(3)], "and 3 is told");
+        assert_eq!(node.take_evicted().len(), 1);
+    }
+
+    #[test]
+    fn a_peer_that_is_merely_out_of_date_is_left_alone() {
+        // The rule has to be one no honest peer can trip. Stale positions,
+        // repeats, announcements that arrive out of order and answers to
+        // questions this node has forgotten are all ordinary, and none of
+        // them is anybody's fault.
+        let mut node = middle_of_a_line();
+
+        node.handle(0, key(1), announce(1, &[]));
+        node.handle(0, key(3), announce(1, &[(2, 1), (3, 1)]));
+        node.handle(0, key(3), Message::Summary(summary_of(&[3, 7])));
+        node.handle(0, key(1), consent_from(1, 2, 1));
+        node.handle(0, key(3), answer(9, &[2], 1, &[(2, 1), (3, 1), (7, 1)]));
+        node.tick(Timing::MILLISECONDS.expiry);
+
+        assert!(
+            node.take_evicted().is_empty(),
+            "nothing here is a fault, however wrong or late it is"
+        );
     }
 
     #[test]
@@ -919,26 +1436,37 @@ mod tests {
         let mut tampered = path(1, &[(2, 1), (3, 1), (7, 1)]);
         tampered[3].cost = 9;
 
-        node.handle(
-            0,
-            key(3),
-            Message::Found(Found {
-                announcement: Announcement::unchecked(tampered),
-                trail: vec![key(2)],
-            }),
+        let forged = Announcement::unchecked(tampered);
+        let bad = Found::answer(
+            &StandIn::for_key(key(7)),
+            forged,
+            nonce(0),
+            vec![key(2)],
         );
+        node.lookup(0, key(7), nonce(0));
+
+        node.handle(0, key(3), Message::Found(bad));
 
         assert!(
             !node.known().any(|known| known == key(7)),
             "an answer is checked exactly as an announcement is"
         );
         assert_eq!(node.send(key(7), b"hi".to_vec()), Err(SendError::Unknown));
+        assert_eq!(
+            node.take_evicted(),
+            vec![Eviction {
+                peer: key(3),
+                fault: Fault::ForgedAnswer,
+            }],
+            "and whoever handed it over made it up"
+        );
     }
 
     #[test]
     fn a_stale_announcement_changes_nothing() {
         let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
         node.add_peer(0, key(1), Cost::UNIT);
+        node.handle(0, key(1), consent_from(1, 2, 1));
 
         let fresh = Announcement::root_of(&signer(1), 5);
         assert!(!node.handle(0, key(1), Message::Announce(fresh)).is_empty());
@@ -1078,7 +1606,8 @@ mod tests {
         let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
         node.add_peer(0, key(3), Cost::UNIT);
         node.handle(0, key(3), announce(1, &[(2, 1), (3, 1)]));
-        node.handle(0, key(3), found(2, 1, &[(2, 1), (4, 1)]));
+        let answer = found(&mut node, 1, &[(2, 1), (4, 1)]);
+        node.handle(0, key(3), answer);
 
         assert_eq!(node.root(), key(2), "this node sits outside that walk now");
         assert_eq!(
@@ -1096,7 +1625,8 @@ mod tests {
         // itself, so there is no hop that makes progress. Saying so beats
         // posting the packet to a peer that would only drop it.
         let mut node = node_below_a_peer(0);
-        node.handle(0, key(1), found(2, 1, &[(2, 1), (4, 1)]));
+        let answer = found(&mut node, 1, &[(2, 1), (4, 1)]);
+        node.handle(0, key(1), answer);
         assert!(node.known().any(|known| known == key(4)));
 
         assert_eq!(
@@ -1160,8 +1690,10 @@ mod tests {
     fn a_looked_up_position_is_forgotten_like_any_other() {
         let mut node = Node::new(0, signer(5), Timing::MILLISECONDS);
         node.add_peer(0, key(2), Cost::UNIT);
+        node.handle(0, key(2), consent_from(2, 5, 1));
         node.handle(0, key(2), announce(1, &[(2, 1)]));
-        node.handle(0, key(2), found(5, 1, &[(2, 1), (4, 1)]));
+        let answer = found(&mut node, 1, &[(2, 1), (4, 1)]);
+        node.handle(0, key(2), answer);
         assert!(node.known().any(|known| known == key(4)));
 
         node.tick(Timing::MILLISECONDS.expiry);
@@ -1229,6 +1761,7 @@ mod tests {
         };
         let mut node = Node::new(0, signer(2), timing);
         node.add_peer(0, key(1), Cost::UNIT);
+        node.handle(0, key(1), consent_from(1, 2, 1));
         node.handle(0, key(1), announce(1, &[]));
 
         node.tick(39);
@@ -1242,6 +1775,8 @@ mod tests {
         let mut node = Node::new(0, signer(4), Timing::MILLISECONDS);
         node.add_peer(0, key(1), cost(10));
         node.add_peer(0, key(2), cost(1));
+        node.handle(0, key(1), consent_from(1, 4, 10));
+        node.handle(0, key(2), consent_from(2, 4, 1));
         node.handle(0, key(1), announce(1, &[]));
         node.handle(0, key(2), announce(1, &[(2, 1)]));
 
@@ -1256,16 +1791,21 @@ mod tests {
     }
 
     #[test]
-    fn re_pricing_a_link_moves_a_node() {
+    fn a_peer_re_pricing_its_side_moves_a_node() {
         let mut node = Node::new(0, signer(4), Timing::MILLISECONDS);
         node.add_peer(0, key(1), Cost::UNIT);
         node.add_peer(0, key(2), Cost::UNIT);
+        node.handle(0, key(1), consent_from(1, 4, 1));
+        node.handle(0, key(2), consent_from(2, 4, 1));
         node.handle(0, key(1), announce(1, &[]));
         node.handle(0, key(2), announce(1, &[(2, 1)]));
         assert_eq!(node.parent(), Some(key(1)), "one hop to the root");
 
-        // The caller measures that link again and finds it much worse.
-        let out = node.add_peer(1, key(1), cost(10));
+        // The root measures that link again and finds it much worse, so the
+        // bargain it is offering changes. The price is the parent's to set,
+        // and a node cannot go on announcing one it is no longer being
+        // offered, because the price is part of what was signed.
+        let out = node.handle(1, key(1), consent_from(1, 4, 10));
 
         assert_eq!(node.parent(), Some(key(2)), "the long way round is cheaper");
         assert_eq!(node.cost_to_root(), 2);
@@ -1353,9 +1893,12 @@ mod tests {
         let mut node = Node::new(0, signer(5), Timing::MILLISECONDS);
         node.add_peer(0, key(2), cost(to_two));
         node.add_peer(0, key(3), cost(to_three));
+        node.handle(0, key(2), consent_from(2, 5, to_two));
+        node.handle(0, key(3), consent_from(3, 5, to_three));
         node.handle(0, key(2), announce(1, &[(2, 1)]));
         node.handle(0, key(3), announce(1, &[(3, 1)]));
-        node.handle(0, key(2), found(5, 1, &[(2, 1), (4, 1)]));
+        let answer = found(&mut node, 1, &[(2, 1), (4, 1)]);
+        node.handle(0, key(2), answer);
         node
     }
 
@@ -1455,25 +1998,26 @@ mod tests {
 
     #[test]
     fn a_search_goes_only_where_a_summary_admits_it_might_be() {
-        let node = middle_of_a_line();
+        let mut node = middle_of_a_line();
 
-        let out = node.lookup(key(7));
+        let out = node.lookup(0, key(7), nonce(0));
         assert_eq!(out.len(), 1, "one branch could hold it");
         assert_eq!(out[0].to, key(3));
         assert_eq!(
             out[0].message,
             Message::Lookup(Lookup {
                 target: key(7),
+                nonce: nonce(0),
                 trail: vec![key(2)],
             })
         );
 
         assert!(
-            node.lookup(key(9)).is_empty(),
+            node.lookup(0, key(9), nonce(1)).is_empty(),
             "no summary admits 9, so nothing is asked"
         );
         assert!(
-            node.lookup(key(2)).is_empty(),
+            node.lookup(0, key(2), nonce(2)).is_empty(),
             "and nobody looks for itself"
         );
     }
@@ -1486,6 +2030,7 @@ mod tests {
             key(1),
             Message::Lookup(Lookup {
                 target: key(7),
+                nonce: nonce(0),
                 trail: vec![key(1)],
             }),
         );
@@ -1496,6 +2041,7 @@ mod tests {
             out[0].message,
             Message::Lookup(Lookup {
                 target: key(7),
+                nonce: nonce(0),
                 trail: vec![key(1), key(2)],
             })
         );
@@ -1509,7 +2055,11 @@ mod tests {
         // tree link and worthless off one: folded around the cycle that link
         // now closes, it would hand every key back to where it came from.
         let mut node = middle_of_a_line();
-        assert_eq!(node.lookup(key(7)).len(), 1, "while 3 was still below");
+        assert_eq!(
+            node.lookup(0, key(7), nonce(0)).len(),
+            1,
+            "while 3 was still below"
+        );
 
         node.handle(
             0,
@@ -1527,7 +2077,7 @@ mod tests {
             "nothing goes down it either"
         );
         assert!(
-            node.lookup(key(7)).is_empty(),
+            node.lookup(0, key(7), nonce(1)).is_empty(),
             "3 still claims 7, and is no longer anybody this node may ask"
         );
     }
@@ -1547,6 +2097,7 @@ mod tests {
             key(1),
             Message::Lookup(Lookup {
                 target: key(7),
+                nonce: nonce(0),
                 trail: vec![key(1)],
             }),
         );
@@ -1563,6 +2114,7 @@ mod tests {
             key(1),
             Message::Lookup(Lookup {
                 target: key(7),
+                nonce: nonce(0),
                 trail: vec![key(2), key(1)],
             }),
         );
@@ -1577,6 +2129,7 @@ mod tests {
             key(1),
             Message::Lookup(Lookup {
                 target: key(2),
+                nonce: nonce(3),
                 trail: vec![key(1)],
             }),
         );
@@ -1585,50 +2138,41 @@ mod tests {
         assert_eq!(out[0].to, key(1), "back the way the search came");
         assert_eq!(
             out[0].message,
-            Message::Found(Found {
-                announcement: node.announcement.clone(),
-                trail: vec![key(1)],
-            })
+            Message::Found(Found::answer(
+                &signer(2),
+                node.announcement.clone(),
+                nonce(3),
+                vec![key(1)],
+            )),
+            "and vouching for the search it is answering"
         );
+        let Message::Found(found) = &out[0].message else {
+            panic!("an answer");
+        };
+        assert!(found.verify::<StandIn>());
     }
 
     #[test]
     fn an_answer_retraces_the_search_and_stops_where_it_started() {
         let mut node = middle_of_a_line();
-        let answer = announcement(1, &[(2, 1), (3, 1), (7, 1)]);
 
         // Passing through: the trail still has the asker on it.
-        let out = node.handle(
-            0,
-            key(3),
-            Message::Found(Found {
-                announcement: answer.clone(),
-                trail: vec![key(1), key(2)],
-            }),
-        );
+        let out = node.handle(0, key(3), answer(0, &[1, 2], 1, &[(2, 1), (3, 1), (7, 1)]));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].to, key(1));
         assert_eq!(
             out[0].message,
-            Message::Found(Found {
-                announcement: answer.clone(),
-                trail: vec![key(1)],
-            })
+            answer(0, &[1], 1, &[(2, 1), (3, 1), (7, 1)])
         );
         assert!(
             !node.known().any(|known| known == key(7)),
             "carrying an answer is not the same as having asked for it"
         );
 
-        // Arriving home: nothing before this node on the trail.
-        let out = node.handle(
-            0,
-            key(3),
-            Message::Found(Found {
-                announcement: answer,
-                trail: vec![key(2)],
-            }),
-        );
+        // Arriving home: nothing before this node on the trail, and a
+        // question of its own that this answers.
+        node.lookup(0, key(7), nonce(0));
+        let out = node.handle(0, key(3), answer(0, &[2], 1, &[(2, 1), (3, 1), (7, 1)]));
         assert!(out.is_empty(), "the answer goes no further");
         assert!(node.known().any(|known| known == key(7)));
         assert!(node.send(key(7), b"found you".to_vec()).is_ok());
@@ -1637,14 +2181,7 @@ mod tests {
     #[test]
     fn an_answer_that_never_came_through_here_is_dropped() {
         let mut node = middle_of_a_line();
-        let out = node.handle(
-            0,
-            key(3),
-            Message::Found(Found {
-                announcement: announcement(1, &[(2, 1), (3, 1), (7, 1)]),
-                trail: vec![key(1), key(8)],
-            }),
-        );
+        let out = node.handle(0, key(3), answer(0, &[1, 8], 1, &[(2, 1), (3, 1), (7, 1)]));
         assert!(out.is_empty());
         assert!(!node.known().any(|known| known == key(7)));
     }

@@ -9,7 +9,9 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use blackwood_ed25519::Ed25519;
-use routing_core::{Announcement, Cost, Envelope, Message, Node, PublicKey, Timing};
+use routing_core::{
+    Announcement, Consent, Cost, Envelope, Message, NONCE_LEN, Node, Nonce, PublicKey, Timing,
+};
 
 /// A short label for a node, shown throughout the UI in place of its key.
 ///
@@ -79,15 +81,23 @@ pub struct Forgery {
     /// Why the altered one was refused, or `None` if it got through, which
     /// would mean the signatures were doing nothing.
     pub refused: Option<String>,
+    /// Why signing a stranger onto the end of this node's walk was refused,
+    /// or `None` if it got through — which would mean anybody could claim a
+    /// link to anybody.
+    pub splice_refused: Option<String>,
 }
 
 impl Forgery {
     /// The JSON fields a caller adds to its response, without the braces.
     pub fn json_fields(&self) -> String {
         format!(
-            r#""genuine":{},"refused":{}"#,
+            r#""genuine":{},"refused":{},"spliceRefused":{}"#,
             self.genuine,
             match &self.refused {
+                Some(why) => json_string(why),
+                None => "null".into(),
+            },
+            match &self.splice_refused {
                 Some(why) => json_string(why),
                 None => "null".into(),
             }
@@ -140,6 +150,11 @@ pub struct Sim {
     searched: Vec<Id>,
     /// Bumped on every change, so the UI can tell whether it needs to redraw.
     version: u64,
+    /// Counts off the numbers searches go out with. A node signs the one it
+    /// is answering, which is what makes an answer evidence that it is alive
+    /// rather than a recording; the number itself comes from out here,
+    /// because the core touches no operating system.
+    nonces: u64,
 }
 
 impl Default for Sim {
@@ -164,6 +179,7 @@ impl Sim {
             log: Vec::new(),
             searched: Vec::new(),
             version: 0,
+            nonces: 0,
         };
         // Labels are handed out in key order for the network the viewer opens
         // on, so that node 1 holds the smallest key, is therefore the root, and
@@ -322,7 +338,11 @@ impl Sim {
         self.require(from)?;
 
         let target = self.require(to)?;
-        let outbound = self.node(from)?.lookup(target);
+        self.nonces += 1;
+        let mut bytes = [0; NONCE_LEN];
+        bytes[..8].copy_from_slice(&self.nonces.to_be_bytes());
+        let (now, nonce) = (self.now, Nonce::new(bytes));
+        let outbound = self.node_mut(from)?.lookup(now, target, nonce);
         self.searched.clear();
         self.enqueue(from, outbound);
         self.run();
@@ -341,17 +361,27 @@ impl Sim {
         Ok(Search { visited, found })
     }
 
-    /// Alters a node's real position and offers the result to the same check
-    /// every node runs on everything it is told.
+    /// Alters a node's real position two ways and offers each to the same
+    /// checks every node runs on everything it is told.
     ///
-    /// The lie is a forged reissue: the sequence number moved on by one, and
-    /// nothing else touched. That is the one alteration that would matter most
-    /// — it would let anybody keep a node that had vanished looking alive,
-    /// which is exactly what expiry exists to prevent.
+    /// The first lie is a forged reissue: the sequence number moved on by one
+    /// and nothing else touched. That is the alteration that would matter most
+    /// to a walk already in circulation — it would let anybody keep a node
+    /// that had vanished looking alive, which is exactly what expiry exists to
+    /// prevent.
     ///
-    /// Nothing is injected into the running network. `Announcement::new` is the
-    /// door every announcement arriving from a link comes through, and this
-    /// shows what happens at it.
+    /// The second is the splice, and it is the one worth money. A stranger
+    /// takes this node's walk — any answer to a search hands one out — and
+    /// signs herself onto the end of it over a link costing one. Every
+    /// signature above her is genuine and her own hop is hers to sign, so
+    /// before positions were bargains this was the cheapest way to claim the
+    /// shortest walk to the root in the neighbourhood, collect whatever peers
+    /// believed it, and leave every one of them unreachable. What she cannot
+    /// produce is the other half: this node's agreement to carry her.
+    ///
+    /// Nothing is injected into the running network. `Announcement::new` and
+    /// `Announcement::extend` are the doors everything arriving from a link
+    /// comes through, and this shows what happens at them.
     pub fn forge(&mut self, id: Id) -> Result<Forgery, String> {
         self.require(id)?;
         let mut path = self.node(id)?.path().to_vec();
@@ -360,10 +390,22 @@ impl Sim {
         // The path is never empty, so there is always a last hop.
         let last = path.len() - 1;
         path[last].seq = path[last].seq.saturating_add(1);
-        let refused = match Announcement::new::<Ed25519>(path) {
+        let refused = match Announcement::new::<Ed25519>(path.clone()) {
             Ok(_) => None,
             Err(why) => Some(why.to_string()),
         };
+
+        // A key belonging to nobody in the network, which is the point: she
+        // needs no standing anywhere to try this.
+        let intruder = Ed25519::from_seed([0xff; 32]);
+        let cheap = Cost::new(1).expect("one is not zero");
+        let splice_refused = Announcement::new::<Ed25519>(self.node(id)?.path().to_vec())
+            .ok()
+            .and_then(|walk| {
+                walk.extend(&intruder, &Consent::issue(&intruder, intruder.key(), cheap), 1)
+            })
+            .is_none()
+            .then(|| format!("{id} never agreed to carry her"));
 
         self.note(&match (&refused, genuine) {
             (Some(why), true) => format!("forged a reissue of {id}: refused, {why}"),
@@ -372,7 +414,15 @@ impl Sim {
             ),
             (None, _) => format!("forged a reissue of {id}: accepted, which is a bug"),
         });
-        Ok(Forgery { genuine, refused })
+        self.note(&match &splice_refused {
+            Some(why) => format!("spliced a stranger below {id}: refused, {why}"),
+            None => format!("spliced a stranger below {id}: accepted, which is a bug"),
+        });
+        Ok(Forgery {
+            genuine,
+            refused,
+            splice_refused,
+        })
     }
 
     /// Sends one packet and traces the path it took, looking the destination
