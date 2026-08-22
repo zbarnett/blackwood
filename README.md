@@ -43,9 +43,10 @@ caller measures, here. A node sits below the peer offering the cheapest walk to
 the root rather than the shortest one, and among the peers that make strict
 progress it hands a packet to whichever leaves the least left to pay. A cost is
 never zero, which is what keeps the two properties above standing; a network
-whose links all cost the same measures distance in hops. Nobody has to agree
-about any of it: each end of a link prices its own end, and a node announces
-what it measured along with where it sits.
+whose links all cost the same measures distance in hops. A link is priced by
+the node above it, because that is the node agreeing to carry the traffic
+across it — see [signing](#signing) for why the other way round is an invitation
+to lie.
 
 The destination's path travels in the packet, since no node along the way holds
 it. That is also what makes the first property exact rather than nearly so:
@@ -76,15 +77,45 @@ of the network.
 
 ## Signing
 
-Every hop of an announcement carries the signature of the node it names, over
-that hop and over every hop above it exactly as they stand. A walk down the tree
-is a chain of statements, each made by the node it is about: nobody can put a
-node somewhere it has not put itself, and no part of one announcement can be
-lifted into another. That is what makes the answer to a search worth having,
-since answering one is the only time a node speaks about anybody but itself.
+Every hop of an announcement carries two signatures: the node it names, over
+that hop and over every hop above it exactly as they stand, and the node in the
+hop above, over this one's key and the price of the link between them. A walk
+down the tree is a chain of bargains, each struck by the two nodes it joins.
+Nobody can put a node somewhere it has not put itself, nobody can put itself
+somewhere it has not been invited, and no part of one announcement can be
+lifted into another.
 
-The core performs none of it. It says what has to be signed and what has to be
-checked, and takes the algorithm as a type parameter — which is how it carries
+That second signature is what a lying node runs into. A position is the one
+thing a node says that is really about two nodes, and it is the profitable
+thing to lie about: claim a link you do not have, price it at nothing, and you
+are advertising the cheapest walk to the root in the neighbourhood. Your peers
+sit below you because that is exactly what the rule tells them to do — and
+every one of them is then unreachable, because the walk the rest of the network
+is routing them by runs through a link that does not exist. The packets die at
+whoever is named on the far end of it, who has no idea why. The lie is as
+attractive as it is destructive, which is what made it worth closing. The price
+travels in the consent for the same reason: the parent is the end that has to
+carry the traffic, so a child cannot advertise a bargain nobody offered it.
+
+Signing settles who, and never when. A signature is as good on a long-dead
+announcement as on a fresh one, and a node hearing about another for the first
+time has nothing to compare a recording against — so the answer to a search
+carries one thing more, the subject's signature over the nonce the search went
+out with. That is the one part of an answer nobody could have recorded earlier.
+Sequence numbers and expiry keep a position current once it is held; the nonce
+is what makes the first one worth holding.
+
+Between them these leave a peer very little room to be dishonest, and a node
+acts on what it catches: a peer that announces a position for somebody else,
+sends a walk that does not check out, hands over a consent meant for another
+node, or passes on an answer its own subject never vouched for is dropped on
+the spot and reported to the caller. Every one of those is either a signature
+that fails or a message no implementation would send. None of them can be
+provoked by a peer that is merely out of date — a rule that fired on stale
+routing state would be a way for one node to make two others drop each other.
+
+The core performs none of the cryptography. It says what has to be signed and
+what has to be checked, and takes the algorithm as a type parameter — which is how it carries
 no dependencies and still refuses to take a stranger's word for anything. There
 is no default and nothing to opt out of: a node cannot be built without a
 [`Signer`](routing-core/src/signature.rs), so whatever a network is running,
@@ -97,7 +128,19 @@ Announcements are soft state. A node reissues its own on a schedule and forgets
 any it has not heard reissued, so a view repairs itself rather than only
 accumulating: a node that vanishes is eventually forgotten instead of lingering
 as a route to nowhere, and one that comes back with its sequence numbers reset
-is not mistaken for a stale copy of itself.
+is not mistaken for a stale copy of itself. Searches are soft state too — a
+node remembers what it has asked and forgets it on the same schedule, which is
+what tells an answer from a peer pushing positions at it unbidden.
+
+## What is still open
+
+Summaries are unsigned, and there is nobody else who could sign one: a summary
+is a claim about one link, made by the node on the far end of it. A node that
+claims everything lies on its side makes searches through it useless and its
+neighbours fold that claim into their own, so the lie spreads; nothing here
+catches it. Nothing bounds how long an arriving path may be either, and
+checking one is quadratic before it is anything else. And the root is whoever
+holds the smallest key, which is a key anybody can grind for.
 
 Nothing in the core performs I/O, reads a clock, allocates a thread, or calls
 into the operating system. It has no dependencies beyond `std`, no `unsafe`, and

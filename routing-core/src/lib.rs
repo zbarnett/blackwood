@@ -90,22 +90,15 @@
 //! the only part that grows with use, and expiry is what bounds it. Nothing
 //! here scales with the size of the network.
 //!
-//! Two things ironwood does are left out, both of them hardening rather than
-//! part of the model above:
+//! One thing ironwood does is left out, and it is hardening rather than part
+//! of the model above:
 //!
-//! - **Consent from a parent.** Every hop here is signed by the node it names,
-//!   so nobody can be placed by anybody else — but a node can still claim to
-//!   sit below a peer that never agreed to it. The claim is largely
-//!   self-defeating, since packets routed to it through that peer are dropped
-//!   by a peer that has no link to it. Ironwood closes it properly: the parent
-//!   signs the hop naming the child, so a position is a bargain rather than an
-//!   assertion. Doing the same here would mean a separate announcement per
-//!   recipient, and the parent rather than the child pricing the link between
-//!   them, which is the whole of why it is not done.
-//! - **Signed summaries and searches.** A [`Summary`] is a claim about one
-//!   link, made by the node on the far end of it, and there is nobody else who
-//!   could sign it. Lying costs a search a wasted detour or an unanswered
-//!   question; it cannot deliver a packet to the wrong node.
+//! - **Signed summaries.** A [`Summary`] is a claim about one link, made by
+//!   the node on the far end of it, and there is nobody else who could sign
+//!   it. Lying costs a search a wasted detour or an unanswered question; it
+//!   cannot deliver a packet to the wrong node. A node that claims everything
+//!   lies on its side does make searches through it useless, and nothing here
+//!   catches that.
 //!
 //! One thing is simply not here yet. An [`Announcement`] can be taken apart
 //! into [`Hop`]s and put back together through [`Announcement::new`], which is
@@ -117,13 +110,38 @@
 //!
 //! # Signing
 //!
-//! Every hop of an announcement carries the signature of the node it names,
-//! over that hop and over every hop above it exactly as they stand. A walk down
-//! the tree is therefore a chain of statements, each made by the node it is
-//! about: nobody can put a node somewhere it has not put itself, and no part of
-//! one announcement can be lifted into another. That is what makes the answer
-//! to a search worth having, since answering one is the only time a node speaks
-//! about anybody but itself.
+//! Every hop of an announcement carries two signatures: the node it names,
+//! over that hop and over every hop above it exactly as they stand, and the
+//! node in the hop above, over this one's key and the price of the link
+//! between them. A walk down the tree is therefore a chain of bargains, each
+//! struck by the two nodes it joins. Nobody can put a node somewhere it has
+//! not put itself, nobody can put itself somewhere it has not been invited,
+//! and no part of one announcement can be lifted into another.
+//!
+//! That matters most for a node that is lying. A position is the one thing a
+//! node says that is really about two nodes, and it is the profitable thing to
+//! lie about: a node claiming a link it does not have, priced at nothing, is
+//! claiming the cheapest walk to the root in the neighbourhood, and its peers
+//! will sit below it because that is exactly what the rule tells them to do.
+//! The nodes it collects are then unreachable, because the walk everyone is
+//! routing them by runs through a link that does not exist — and the packets
+//! die at whoever is named on the far end of it, who has no idea why. Consent
+//! is what closes that: the price is the parent's, so it cannot be understated
+//! either.
+//!
+//! What signing still does not settle is *when*. A signature is as good on a
+//! long-dead announcement as on a fresh one, and a node hearing about another
+//! for the first time has nothing to compare a recording against. So the
+//! answer to a search carries one thing more: the subject's signature over the
+//! [`Nonce`] the search went out with, which is the one part of an answer that
+//! cannot have been recorded earlier. Sequence numbers and expiry keep a
+//! position current once it is held; the nonce is what makes the first one
+//! worth holding.
+//!
+//! Between them these leave a peer very little room to be dishonest without
+//! being caught at it, and a node acts on what it catches: see [`Fault`] for
+//! what counts as being caught, and why none of it can be triggered by a peer
+//! that is merely out of date.
 //!
 //! The core performs none of this. It says what has to be signed and what has
 //! to be checked, and takes the algorithm as a type parameter — which is how it
@@ -229,8 +247,8 @@ pub mod tree;
 mod stand_in;
 
 pub use key::{KEY_LEN, PublicKey};
-pub use message::{Envelope, Found, Lookup, Message, Packet, Traffic};
-pub use node::{Node, SendError, Timing};
+pub use message::{Envelope, Found, Lookup, Message, NONCE_LEN, Nonce, Packet, Traffic};
+pub use node::{Eviction, Fault, Node, SendError, Timing};
 pub use signature::{SIGNATURE_LEN, Signature, Signer};
 pub use summary::Summary;
-pub use tree::{Announcement, Cost, Hop, MalformedAnnouncement};
+pub use tree::{Announcement, Consent, Cost, Hop, MalformedAnnouncement};
