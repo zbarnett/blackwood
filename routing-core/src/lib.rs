@@ -47,7 +47,7 @@
 //!
 //! Addressing a node that is not a peer means finding out where it sits first.
 //! Each node keeps, for each of its tree links, a [`Summary`] of the keys
-//! reachable through it — a Bloom filter, a fixed few bytes however much lies
+//! reachable through it — a Bloom filter, a fixed kilobyte however much lies
 //! beyond — got by folding together what its *other* tree links told it.
 //! Leaving out the link the summary is bound for is the whole trick: it makes
 //! each one mean "what is on my side of this", and it is why summaries cross
@@ -247,7 +247,9 @@ pub mod tree;
 mod stand_in;
 
 pub use key::{KEY_LEN, PublicKey};
-pub use message::{Envelope, Found, Lookup, Message, NONCE_LEN, Nonce, Packet, Traffic};
+pub use message::{
+    Envelope, Found, Lookup, MAX_PAYLOAD_LEN, Message, NONCE_LEN, Nonce, Packet, Traffic,
+};
 pub use node::{Eviction, Fault, Node, SendError, Timing};
 pub use signature::{SIGNATURE_LEN, Signature, Signer};
 pub use summary::Summary;

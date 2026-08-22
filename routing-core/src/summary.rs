@@ -14,12 +14,16 @@ use crate::key::PublicKey;
 /// A key that was inserted always tests present, so a search guided by
 /// summaries never overlooks the branch its target is really on. A key that was
 /// not may test present anyway, which costs a search a wasted detour and
-/// nothing else. With [`Summary::BITS`] bits and four of them set per key, that
-/// happens for roughly one key in four hundred at sixteen nodes to a summary,
-/// one in forty at thirty-two, and one in two at a hundred and twenty-eight.
-/// Ironwood uses a filter thirty-two times this size;
-/// [`BITS`](Summary::BITS) is the only thing standing between this and a
-/// network of that size.
+/// nothing else. With [`Summary::BITS`] bits and eight of them set per key, that
+/// happens for roughly one key in a hundred and seventy thousand at two hundred
+/// and fifty-six nodes to a summary, one in seventeen hundred at five hundred
+/// and twelve, one in forty at a thousand, and one in three at two thousand.
+/// Past that it prunes nothing and a search is a flood.
+///
+/// These are ironwood's own dimensions. A summary was a quarter of a kilobit
+/// here until it was not, which put the useful ceiling at a few dozen nodes to
+/// a link; the cost of lifting it is the thirty-two fold in the line below,
+/// paid per tree link and nowhere else.
 ///
 /// Folding summaries together is the core's own business, so a caller cannot
 /// build one — only ask a summary it was handed what it
@@ -33,11 +37,11 @@ pub struct Summary {
 
 impl Summary {
     /// How many bits a summary holds.
-    pub const BITS: usize = 256;
+    pub const BITS: usize = 8192;
 
     /// How many of them each key sets. Internal tuning: a caller has no
     /// summary of its own to build, so nothing outside can act on it.
-    const HASHES: usize = 4;
+    const HASHES: usize = 8;
 
     /// The summary of nothing at all, which claims no key.
     pub(crate) const fn new() -> Self {
@@ -98,8 +102,11 @@ impl fmt::Debug for Summary {
 /// that went into it last, so keys alike towards their end land on positions
 /// alike in the same narrow way. Keys made of one byte repeated, which is what
 /// this crate's tests are built from, are the worst of it — thirty-two of them
-/// set thirteen bits of a summary between them without the mix, and a hundred
-/// and four with it.
+/// set two hundred and eight bits of a summary between them without the mix,
+/// and two hundred and fifty-three of a possible two hundred and fifty-six with
+/// it. A wider filter takes thirteen bits of the word rather than eight and so
+/// leans on the mix less than it did; at [`BITS`](Summary::BITS) of 256 the same
+/// keys set thirteen bits without it and a hundred and four with.
 fn position(key: PublicKey, round: usize) -> usize {
     let hash = mix(fnv1a(round as u8, key.as_bytes()));
     // `BITS` is a power of two, so this is a remainder and cannot exceed it.
@@ -146,6 +153,14 @@ mod tests {
         PublicKey::new([n; KEY_LEN])
     }
 
+    /// A key that varies across its whole width, for the tests that need more
+    /// distinct keys than the two hundred and fifty-six `key` can name.
+    fn varied_key(n: u32) -> PublicKey {
+        let mut bytes = [0; KEY_LEN];
+        bytes[..4].copy_from_slice(&n.to_be_bytes());
+        PublicKey::new(bytes)
+    }
+
     #[test]
     fn an_empty_summary_claims_nothing() {
         let summary = Summary::new();
@@ -170,17 +185,17 @@ mod tests {
         for n in 0..32 {
             summary.insert(key(n));
         }
-        // Thirty-two keys setting four bits each land on 128 positions out of
-        // 256. Some collide; a hash that spread them badly would show up here
-        // as a summary far emptier than this bound allows — which is exactly
-        // what these keys, each a single byte repeated, do without the mix
-        // that finishes `position`.
+        // Thirty-two keys setting eight bits each land on 256 positions out of
+        // 8192. Almost none collide at this width; a hash that spread them
+        // badly would show up here as a summary far emptier than this bound
+        // allows — which is exactly what these keys, each a single byte
+        // repeated, do without the mix that finishes `position`.
         assert!(
-            summary.filled() > 80,
+            summary.filled() > 240,
             "only {} bits set, so keys are colliding",
             summary.filled()
         );
-        assert!(summary.filled() <= 128);
+        assert!(summary.filled() <= 256);
     }
 
     #[test]
@@ -214,14 +229,22 @@ mod tests {
         // Nothing here breaks when a summary saturates; it just stops pruning,
         // which is the graceful end of the trade rather than a failure.
         let mut summary = Summary::new();
-        for n in 0..=255 {
-            summary.insert(key(n));
+        for n in 0..4096 {
+            summary.insert(varied_key(n));
         }
-        // 256 keys setting four bits apiece leave about e^-4 of the filter
-        // clear, so it saturates without ever quite filling.
-        assert!(summary.filled() > 240, "only {} bits set", summary.filled());
-        assert!(summary.contains(key(7)));
-        let wrong = (0..=255).filter(|&n| !summary.contains(key(n))).count();
+        // 4096 keys setting eight bits apiece leave about e^-4 of the filter
+        // clear, so it saturates without ever quite filling — the same shape as
+        // 256 keys at four bits did before the filter was widened, which is
+        // what the thirty-two fold bought.
+        assert!(
+            summary.filled() > 8000,
+            "only {} bits set",
+            summary.filled()
+        );
+        assert!(summary.contains(varied_key(7)));
+        let wrong = (0..4096)
+            .filter(|&n| !summary.contains(varied_key(n)))
+            .count();
         assert_eq!(wrong, 0, "a saturated summary still misses nothing");
     }
 }

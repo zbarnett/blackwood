@@ -10,6 +10,20 @@ use crate::tree::{Announcement, Consent, Hop};
 /// The length of a search nonce in bytes.
 pub const NONCE_LEN: usize = 16;
 
+/// The most a [`Packet`] may carry, in bytes.
+///
+/// The largest an IPv6 packet can be, which is what yggdrasil hands ironwood
+/// and so the size of the thing this is built to carry. It is a protocol
+/// constant rather than a local preference, and that is the whole of its
+/// value: every node on a route agrees where the ceiling is, so a packet is
+/// refused by the node that originates it rather than somewhere unpredictable
+/// further along, and a node handing over more than this is one no
+/// implementation of this protocol produced.
+///
+/// Routing carries what it is given and does not fragment. Splitting a larger
+/// message up is the caller's, as is putting it back together.
+pub const MAX_PAYLOAD_LEN: usize = 65_535;
+
 /// The one-off number a search carries, so that its answer can be tied to it.
 ///
 /// The core generates none of its own, for the same reason it reads no clock:
@@ -52,6 +66,14 @@ pub struct Packet {
     /// The node it is addressed to.
     pub dst: PublicKey,
     /// The bytes being carried, opaque to routing.
+    ///
+    /// At most [`MAX_PAYLOAD_LEN`] of them. Nothing checks that on a value
+    /// being built, since a `Packet` is a plain struct a caller fills in; the
+    /// rule is enforced at the two places it can be broken, by [`send`]
+    /// refusing to originate one and by a node dropping the peer that forwards
+    /// one.
+    ///
+    /// [`send`]: crate::node::Node::send
     pub payload: Vec<u8>,
 }
 

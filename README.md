@@ -57,7 +57,7 @@ than against its own copy of one.
 
 Addressing a node that is not a peer means finding where it sits first. Each
 node keeps, per tree link, a Bloom filter of the keys reachable through it — a
-fixed few bytes however much lies beyond — built by folding together what its
+fixed kilobyte however much lies beyond — built by folding together what its
 *other* tree links told it. Leaving out the link the summary is bound for is
 the whole trick: it makes each one mean "what is on my side of this". It is
 also why summaries cross tree links only, since folded around a cycle they
@@ -108,8 +108,9 @@ is what makes the first one worth holding.
 Between them these leave a peer very little room to be dishonest, and a node
 acts on what it catches: a peer that announces a position for somebody else,
 sends a walk that does not check out, hands over a consent meant for another
-node, or passes on an answer its own subject never vouched for is dropped on
-the spot and reported to the caller. Every one of those is either a signature
+node, passes on an answer its own subject never vouched for, or forwards a
+packet longer than the protocol carries is dropped on the spot and reported to
+the caller. Every one of those is either a signature
 that fails or a message no implementation would send. None of them can be
 provoked by a peer that is merely out of date — a rule that fired on stale
 routing state would be a way for one node to make two others drop each other.

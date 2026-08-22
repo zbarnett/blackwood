@@ -17,6 +17,7 @@
   const nodes = $derived(state?.nodes ?? []);
   const links = $derived(state?.links ?? []);
   const clock = $derived(((state?.now ?? 0) / 1000).toFixed(1));
+  const summaryBits = $derived(state?.summaryBits ?? 0);
 
   async function call(command, params = {}) {
     if (!transport) return null;
@@ -168,7 +169,7 @@
 
     {#if error}<p class="error">{error}</p>{/if}
 
-    <Graph {nodes} {links} {selected} {flight} {search} onpick={pick} />
+    <Graph {nodes} {links} {selected} {flight} {search} {summaryBits} onpick={pick} />
 
     <p class="legend">
       <span class="swatch root"></span> root

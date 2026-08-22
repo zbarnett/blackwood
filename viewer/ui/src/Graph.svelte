@@ -2,7 +2,7 @@
   // The network drawn as a graph: nodes on a circle, links between them.
   // Tree links (a node and its parent) are solid, every other link is dashed,
   // and each carries the cost of crossing it.
-  let { nodes, links, selected, flight, search, onpick } = $props();
+  let { nodes, links, selected, flight, search, summaryBits, onpick } = $props();
 
   const WIDTH = 760;
   const HEIGHT = 520;
@@ -90,7 +90,7 @@
         class:lit={lit.has(`${link.a}-${link.b}`)}
       >
         <title>{link.tree
-          ? `${link.a}\u2192${link.b} summary ${link.summary[0]}/256 bits, ${link.b}\u2192${link.a} ${link.summary[1]}/256`
+          ? `${link.a}\u2192${link.b} summary ${link.summary[0]}/${summaryBits} bits, ${link.b}\u2192${link.a} ${link.summary[1]}/${summaryBits}`
           : 'not a tree link, so no summary crosses it'}</title>
       </line>
     {/if}
