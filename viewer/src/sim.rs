@@ -10,7 +10,8 @@ use std::collections::{BTreeMap, VecDeque};
 
 use blackwood_ed25519::Ed25519;
 use routing_core::{
-    Announcement, Consent, Cost, Envelope, Message, NONCE_LEN, Node, Nonce, PublicKey, Timing,
+    Announcement, Consent, Cost, Envelope, Message, NONCE_LEN, Node, Nonce, PublicKey, Summary,
+    Timing,
 };
 
 /// A short label for a node, shown throughout the UI in place of its key.
@@ -526,8 +527,12 @@ impl Sim {
             .join(",");
 
         format!(
-            r#"{{"version":{},"now":{},"nodes":[{nodes}],"links":[{links}],"log":[{log}]}}"#,
-            self.version, self.now
+            r#"{{"version":{},"now":{},"summaryBits":{},"nodes":[{nodes}],"links":[{links}],"log":[{log}]}}"#,
+            self.version,
+            self.now,
+            // Sent rather than written into the page, so that widening a
+            // summary in the core cannot leave the label beside it lying.
+            Summary::BITS
         )
     }
 

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::key::PublicKey;
-use crate::message::{Envelope, Found, Lookup, Message, Nonce, Packet, Traffic};
+use crate::message::{Envelope, Found, Lookup, MAX_PAYLOAD_LEN, Message, Nonce, Packet, Traffic};
 use crate::signature::Signer;
 use crate::summary::Summary;
 use crate::tree::{Announcement, Consent, Cost, Hop, distance};
@@ -22,6 +22,15 @@ pub enum SendError {
     /// The destination's position is known, but no linked peer stands closer to
     /// it than this node does, so the packet has nowhere to go but backwards.
     NoRoute,
+    /// The payload is longer than [`MAX_PAYLOAD_LEN`].
+    ///
+    /// Every node on a route holds the same limit, so refusing it here is what
+    /// keeps a packet from being dropped somewhere unpredictable further along
+    /// instead. Splitting the message up is the caller's to do; routing carries
+    /// what it is given and does not fragment.
+    ///
+    /// [`MAX_PAYLOAD_LEN`]: crate::message::MAX_PAYLOAD_LEN
+    TooLarge,
 }
 
 impl fmt::Display for SendError {
@@ -29,6 +38,7 @@ impl fmt::Display for SendError {
         match self {
             Self::Unknown => f.write_str("destination has not been looked up"),
             Self::NoRoute => f.write_str("no route to destination"),
+            Self::TooLarge => f.write_str("payload is longer than the protocol carries"),
         }
     }
 }
@@ -63,6 +73,16 @@ pub enum Fault {
     /// an answer that does not hold together cannot have travelled: whoever
     /// handed this one over is where it was made up.
     ForgedAnswer,
+    /// Traffic carrying more than [`MAX_PAYLOAD_LEN`] bytes.
+    ///
+    /// The ceiling is a protocol constant and a node refuses to originate a
+    /// packet above it, so one that size cannot have reached here by honest
+    /// means — not through staleness, which does not change how long a payload
+    /// is, and not through disagreement, since there is nothing here to
+    /// disagree about.
+    ///
+    /// [`MAX_PAYLOAD_LEN`]: crate::message::MAX_PAYLOAD_LEN
+    OversizedPayload,
 }
 
 impl fmt::Display for Fault {
@@ -72,6 +92,9 @@ impl fmt::Display for Fault {
             Self::ForgedAnnouncement => f.write_str("announced a position nobody signed for"),
             Self::MisdirectedConsent => f.write_str("gave a consent meant for somebody else"),
             Self::ForgedAnswer => f.write_str("answered a search with something unsigned"),
+            Self::OversizedPayload => {
+                f.write_str("forwarded a packet longer than the protocol carries")
+            }
         }
     }
 }
@@ -419,7 +442,7 @@ impl<S: Signer> Node<S> {
             Message::Consent(consent) => self.receive_consent(now, from, consent, &mut out),
             Message::Lookup(lookup) => self.receive_lookup(from, lookup, &mut out),
             Message::Found(found) => self.receive_found(now, from, found, &mut out),
-            Message::Traffic(traffic) => self.forward(traffic, &mut out),
+            Message::Traffic(traffic) => self.receive_traffic(now, from, traffic, &mut out),
         }
         out
     }
@@ -431,6 +454,12 @@ impl<S: Signer> Node<S> {
     /// recently. That position travels with the packet, since no node further
     /// along the way holds it either.
     pub fn send(&mut self, dst: PublicKey, payload: Vec<u8>) -> Result<Vec<Envelope>, SendError> {
+        // Before the destination is even looked at, and before the packet
+        // addressed to this node itself takes its shortcut below: the limit is
+        // what the protocol carries, not what this particular hop could manage.
+        if payload.len() > MAX_PAYLOAD_LEN {
+            return Err(SendError::TooLarge);
+        }
         let packet = Packet {
             src: self.key,
             dst,
@@ -893,6 +922,30 @@ impl<S: Signer> Node<S> {
                 });
             }
         }
+    }
+
+    /// Takes in traffic that arrived from `from`, and passes it on if it is
+    /// something a node running this protocol could have sent.
+    ///
+    /// The size is settled before anything else happens to the packet,
+    /// delivery to this node included. A peer that hands over more than
+    /// [`MAX_PAYLOAD_LEN`] is not out of date about anything — the ceiling is
+    /// the same everywhere and always has been — so it is dropped rather than
+    /// merely disregarded.
+    ///
+    /// [`MAX_PAYLOAD_LEN`]: crate::message::MAX_PAYLOAD_LEN
+    fn receive_traffic(
+        &mut self,
+        now: u64,
+        from: PublicKey,
+        traffic: Traffic,
+        out: &mut Vec<Envelope>,
+    ) {
+        if traffic.packet.payload.len() > MAX_PAYLOAD_LEN {
+            self.evict(now, from, Fault::OversizedPayload, out);
+            return;
+        }
+        self.forward(traffic, out);
     }
 
     fn forward(&mut self, traffic: Traffic, out: &mut Vec<Envelope>) {
@@ -1540,6 +1593,95 @@ mod tests {
         assert!(
             node.take_delivered().is_empty(),
             "carrying a packet is not being addressed by it"
+        );
+    }
+
+    #[test]
+    fn a_payload_the_protocol_will_not_carry_is_refused_at_its_source() {
+        let mut node = node_below_a_peer(0);
+        assert_eq!(
+            node.send(key(1), vec![0; MAX_PAYLOAD_LEN + 1]),
+            Err(SendError::TooLarge),
+            "one byte over is over"
+        );
+        assert!(
+            node.send(key(1), vec![0; MAX_PAYLOAD_LEN]).is_ok(),
+            "and the limit itself is carried"
+        );
+        assert_eq!(
+            node.send(key(2), vec![0; MAX_PAYLOAD_LEN + 1]),
+            Err(SendError::TooLarge),
+            "a packet addressed to this node is not a way around the ceiling"
+        );
+        assert!(
+            node.take_delivered().is_empty(),
+            "so nothing was delivered by the shortcut either"
+        );
+    }
+
+    #[test]
+    fn a_peer_forwarding_a_payload_the_protocol_will_not_carry_is_refused() {
+        // The ceiling is the same at every node and does not move, so a peer
+        // handing over more than it is not out of date about anything.
+        let mut node = middle_of_a_line();
+        let out = node.handle(
+            0,
+            key(1),
+            Message::Traffic(Traffic {
+                dst_path: path(1, &[(2, 1), (3, 1)]),
+                packet: Packet {
+                    src: key(1),
+                    dst: key(3),
+                    payload: vec![0; MAX_PAYLOAD_LEN + 1],
+                },
+            }),
+        );
+
+        assert!(
+            !out.iter()
+                .any(|envelope| matches!(envelope.message, Message::Traffic(_))),
+            "the packet goes no further"
+        );
+        assert_eq!(
+            node.take_evicted(),
+            vec![Eviction {
+                peer: key(1),
+                fault: Fault::OversizedPayload,
+            }]
+        );
+        assert_eq!(
+            node.peers().map(|(peer, _)| peer).collect::<Vec<_>>(),
+            vec![key(3)],
+            "so it is not a peer any more"
+        );
+    }
+
+    #[test]
+    fn an_oversized_packet_addressed_here_is_refused_rather_than_delivered() {
+        // Being the destination is not a reason to take it: the peer that
+        // handed it over still broke the same rule, and delivering it first
+        // would be acting on the thing that proves it.
+        let mut node = middle_of_a_line();
+        node.handle(
+            0,
+            key(1),
+            Message::Traffic(Traffic {
+                dst_path: path(1, &[(2, 1)]),
+                packet: Packet {
+                    src: key(1),
+                    dst: key(2),
+                    payload: vec![0; MAX_PAYLOAD_LEN + 1],
+                },
+            }),
+        );
+
+        assert!(node.take_delivered().is_empty());
+        assert_eq!(
+            node.take_evicted(),
+            vec![Eviction {
+                peer: key(1),
+                fault: Fault::OversizedPayload,
+            }]
         );
     }
 
