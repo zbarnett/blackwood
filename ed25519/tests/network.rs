@@ -114,13 +114,13 @@ impl Network {
 
 /// Five nodes in the shape the core's simulation uses, but keyed by ed25519.
 ///
-/// Every link costs five rather than one, so that a node claiming a link cost
-/// of one would be claiming something — which is what the forgery test needs.
+/// The shape is what the forgery tests need: whichever of these keys turns out
+/// to be smallest, somebody ends up two links down from it, and a walk with
+/// something in the middle of it is a walk with something to rub out.
 fn ring_with_a_tail() -> (Network, Vec<PublicKey>) {
-    let dear = Cost::new(5).expect("not zero");
     let (mut net, keys) = Network::new(5);
     for (near, far) in [(0, 1), (1, 2), (2, 3), (1, 3), (3, 4)] {
-        net.link(keys[near], keys[far], dear);
+        net.link(keys[near], keys[far], Cost::UNIT);
     }
     net.run();
     (net, keys)
@@ -183,21 +183,22 @@ fn every_node_can_find_and_reach_every_other() {
 #[test]
 fn a_position_nobody_signed_for_is_refused() {
     let (net, keys) = ring_with_a_tail();
-    // The largest key is the one node that certainly is not the root, so it
-    // certainly sits below somebody and has a link whose price can be lied
-    // about. Which node that is depends on keys nobody chose.
-    let victim = *keys.iter().max().expect("the network is not empty");
-    assert!(net.node(victim).parent().is_some());
+    // Whoever ended up furthest down the tree: it has a walk with a hop in the
+    // middle of it, which is the thing worth rubbing out. Which node that is
+    // depends on keys nobody chose.
+    let victim = *keys
+        .iter()
+        .max_by_key(|&&k| net.node(k).depth())
+        .expect("the network is not empty");
+    assert!(net.node(victim).depth() >= 2, "something to lie about");
 
-    // Take its genuine announcement and rub out the price of its last link,
-    // the cheapest lie available: it would put the author nearer the root than
-    // it has any right to be, and pull traffic through it.
-    let mut cheaper = net.node(victim).path().to_vec();
-    let last = cheaper.len() - 1;
-    assert_eq!(cheaper[last].cost, 5, "there is something to lie about");
-    cheaper[last].cost = 1;
+    // Take its genuine announcement and cut out the hop above it, the cheapest
+    // lie available: it would put the author nearer the root than it has any
+    // right to be, and pull traffic through it.
+    let mut shortened = net.node(victim).path().to_vec();
+    shortened.remove(shortened.len() - 2);
     assert_eq!(
-        Announcement::new::<Ed25519>(cheaper),
+        Announcement::new::<Ed25519>(shortened),
         Err(MalformedAnnouncement::BadSignature)
     );
 
@@ -206,7 +207,7 @@ fn a_position_nobody_signed_for_is_refused() {
     // own and writes the victim's name on the end of it.
     let mallory = Ed25519::from_seed([200; 32]);
     let accomplice = Ed25519::from_seed([201; 32]);
-    let consent = Consent::issue(&mallory, accomplice.key(), Cost::UNIT);
+    let consent = Consent::issue(&mallory, accomplice.key());
     let mut impersonated = Announcement::root_of(&mallory, 0)
         .extend(&accomplice, &consent, 0)
         .expect("distinct keys")
@@ -224,9 +225,9 @@ fn a_position_nobody_signed_for_is_refused() {
 fn a_node_cannot_sign_itself_onto_a_walk_it_has_no_link_to() {
     // The splice: Mallory holds somebody else's genuine announcement — a
     // search's answer carries one, so anybody can have any node's — and signs
-    // herself onto the end of it over a link costing one. Every signature
-    // above her is real and her own hop is signed properly. What she cannot
-    // produce is the other end of the bargain.
+    // herself onto the end of it. Every signature above her is real and her
+    // own hop is signed properly. What she cannot produce is the other end of
+    // the bargain.
     let (net, keys) = ring_with_a_tail();
     let root = net.node(keys[0]).root();
     let mallory = Ed25519::from_seed([200; 32]);
@@ -236,33 +237,37 @@ fn a_node_cannot_sign_itself_onto_a_walk_it_has_no_link_to() {
     // The constructor will not build it: a consent she signed herself is not
     // the root agreeing to carry her, and it names both ends so she cannot
     // pass it off as one.
-    let her_own = Consent::issue(&mallory, mallory.key(), Cost::UNIT);
+    let her_own = Consent::issue(&mallory, mallory.key());
     assert_eq!(stolen.extend(&mallory, &her_own, 1), None);
 
     // Nor by borrowing one the root really did issue, to somebody else.
-    let elsewhere = Consent::issue(&Ed25519::from_seed([1; 32]), mallory.key(), Cost::UNIT);
+    let elsewhere = Consent::issue(&Ed25519::from_seed([1; 32]), mallory.key());
     assert_eq!(stolen.extend(&mallory, &elsewhere, 1), None);
 
     // The walk she is left with is the one she can sign for on her own: her
     // own, with nobody above her.
     let alone = Announcement::root_of(&mallory, 1);
     assert_eq!(alone.path().len(), 1);
-    assert_eq!(alone.cost_to_root(), 0);
+    assert_eq!(alone.depth(), 0);
 
     // And the one thing she can do — sit below a node that really did agree
-    // to carry her — is not a lie at all, and puts her where the price that
-    // node named says she is, not where she would like to be.
+    // to carry her — is not a lie at all, and puts her one link below her
+    // host rather than wherever she would like to be.
     let (mut net, keys) = ring_with_a_tail();
     let host = keys[0];
     net.nodes.insert(
         mallory.key(),
         Node::new(0, Ed25519::from_seed([200; 32]), Timing::MILLISECONDS),
     );
-    net.link(host, mallory.key(), Cost::new(5).expect("not zero"));
+    net.link(host, mallory.key(), Cost::UNIT);
     net.run();
 
     let path = net.node(mallory.key()).path();
-    assert_eq!(path[path.len() - 1].cost, 5, "the price her host named");
+    assert_eq!(
+        path[path.len() - 2].key,
+        host,
+        "below the node that took her"
+    );
     assert!(path.len() > 1, "a position she was actually offered");
     assert!(
         Announcement::new::<Ed25519>(path.to_vec()).is_ok(),

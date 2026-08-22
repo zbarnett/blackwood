@@ -1,6 +1,5 @@
 //! The per-node routing state machine.
 
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -8,7 +7,7 @@ use crate::key::PublicKey;
 use crate::message::{Envelope, Found, Lookup, MAX_PAYLOAD_LEN, Message, Nonce, Packet, Traffic};
 use crate::signature::Signer;
 use crate::summary::Summary;
-use crate::tree::{Announcement, Consent, Cost, Hop, distance};
+use crate::tree::{Announcement, Consent, Hop, distance};
 
 /// Why a packet could not be handed to the network.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -181,6 +180,48 @@ struct Info {
     heard_at: u64,
 }
 
+/// What crossing one link costs, as the node at this end of it measures.
+///
+/// Ironwood measures a peering's latency; here the number is whatever the
+/// caller says it is, counted in whatever unit it likes. Only the ordering
+/// matters, and only among one node's own links, because that is the only
+/// place the number is ever read: a price is never announced, never signed,
+/// and never asked of anybody else.
+///
+/// That is what makes it safe for a price to be wrong, or to disagree with
+/// what the far end of the same link thinks, or to change every second. No
+/// walk quotes it, so nothing sums it and nothing verifies it; the most it
+/// decides is which of two hops that were equally good anyway a node reaches
+/// for. A caller that keeps measuring its links can therefore report what it
+/// finds as often as it likes, and no message crosses the network as a result.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Cost(u64);
+
+impl Cost {
+    /// The price of a link nothing has been measured about.
+    ///
+    /// A caller with no measurement to offer gives every link this one, and
+    /// then every tie falls through to the rule below it, which is the same
+    /// everywhere.
+    pub const UNIT: Self = Self(1);
+
+    /// Wraps a measurement.
+    pub const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    /// The measurement itself.
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for Cost {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// What a node keeps about one link.
 ///
 /// A fixed amount, whatever the network beyond it looks like. The peer's own
@@ -188,7 +229,7 @@ struct Info {
 /// is where routing reads it from.
 #[derive(Clone, Debug)]
 struct Peer {
-    /// What crossing the link costs.
+    /// What crossing the link costs, as this node last measured it.
     cost: Cost,
     /// What the peer says lies on its side of it.
     beyond: Summary,
@@ -196,9 +237,9 @@ struct Peer {
     /// nothing because the link is not part of the tree. Keeping it is what
     /// lets a node speak only when something has changed, and so fall quiet.
     told: Option<Summary>,
-    /// The peer's agreement that this node may sit below it, and at what
-    /// price, or `None` while none has arrived. Without one this node cannot
-    /// take up a position below the peer at all, however attractive it looks.
+    /// The peer's agreement that this node may sit below it, or `None` while
+    /// none has arrived. Without one this node cannot take up a position below
+    /// the peer at all, however attractive it looks.
     consent: Option<Consent>,
 }
 
@@ -293,17 +334,18 @@ impl<S: Signer> Node<S> {
         self.announcement.parent()
     }
 
-    /// The path from the root down to this node, priced link by link.
+    /// The path from the root down to this node.
     pub fn path(&self) -> &[Hop] {
         self.announcement.path()
     }
 
-    /// What the walk from this node up to the root costs.
-    pub fn cost_to_root(&self) -> u64 {
-        self.announcement.cost_to_root()
+    /// How many links the walk from this node up to the root crosses.
+    pub fn depth(&self) -> usize {
+        self.announcement.depth()
     }
 
-    /// The peers this node holds a link to, and what each link costs.
+    /// The peers this node holds a link to, and what this node measured each
+    /// link to cost.
     pub fn peers(&self) -> impl Iterator<Item = (PublicKey, Cost)> + '_ {
         self.peers.iter().map(|(&peer, state)| (peer, state.cost))
     }
@@ -363,13 +405,16 @@ impl<S: Signer> Node<S> {
 
     /// Brings up a link to `peer`, costing `cost` to cross.
     ///
-    /// The peer is told where this node sits and given leave to sit below it
-    /// at `cost`, and nothing else: that is all it needs in order to decide
-    /// whether to, and it learns the rest of the network the way anybody does,
-    /// by asking.
+    /// The peer is told where this node sits and given leave to sit below it,
+    /// and nothing else: that is all it needs in order to decide whether to,
+    /// and it learns the rest of the network the way anybody does, by asking.
     ///
     /// Calling this for a link that is already up re-prices it instead, which
     /// is how a caller that keeps measuring its links reports what it found.
+    /// Nothing is said about the new price, because it is nobody else's
+    /// business: the most it can do is move this node from one peer to another
+    /// that was exactly as near the root, and what the peers are told then is
+    /// that it moved.
     pub fn add_peer(&mut self, now: u64, peer: PublicKey, cost: Cost) -> Vec<Envelope> {
         let mut out = Vec::new();
         if peer == self.key {
@@ -396,17 +441,16 @@ impl<S: Signer> Node<S> {
                     to: peer,
                     message: Message::Announce(self.announcement.clone()),
                 });
+                // A new link is a bargain on offer, and the peer cannot take
+                // up a position below this node without holding this. There is
+                // only ever one to give: it says the link exists and who it
+                // joins, and neither of those changes while it is up.
+                out.push(Envelope {
+                    to: peer,
+                    message: Message::Consent(Consent::issue(&self.signer, peer)),
+                });
             }
         }
-        // Either way the peer is owed this node's agreement to carry it, at
-        // the price this node has just put on the link. A re-priced link is a
-        // different bargain, so the old consent is withdrawn by being
-        // replaced: the peer cannot go on announcing the old number, because
-        // the number is part of what was signed.
-        out.push(Envelope {
-            to: peer,
-            message: Message::Consent(Consent::issue(&self.signer, peer, cost)),
-        });
         self.settle(now, &mut out);
         out
     }
@@ -840,27 +884,29 @@ impl<S: Signer> Node<S> {
     /// cannot sign is not one it could take up — and every candidate below a
     /// peer needs that peer's consent for the same reason. A node with nowhere
     /// it is welcome is the root of its own tree, which is where every node
-    /// starts.
+    /// starts. Candidates are ranked by [`rank`].
     fn best_position(&self, seq: u64) -> Announcement {
-        let mut best = Announcement::root_of(&self.signer, seq);
+        // Rooting itself crosses no link, so there is no price on it — and
+        // none is ever compared, since it is the only candidate a single hop
+        // long and length is weighed first.
+        let mut best = (Announcement::root_of(&self.signer, seq), None);
         for (peer, state) in &self.peers {
             let Some(info) = self.info(peer) else {
                 continue;
             };
-            // No consent, no position. The price in it is the peer's, not this
-            // node's, so what a candidate costs to reach is what the node
-            // carrying it said it would cost.
+            // No consent, no position: a place in the tree is a bargain, and
+            // this is the peer's half of it.
             let Some(consent) = &state.consent else {
                 continue;
             };
             let Some(candidate) = info.extend(&self.signer, consent, seq) else {
                 continue;
             };
-            if candidate.preference_cmp(&best) == Ordering::Less {
-                best = candidate;
+            if rank(&candidate, Some(state.cost)) < rank(&best.0, best.1) {
+                best = (candidate, Some(state.cost));
             }
         }
-        best
+        best.0
     }
 
     /// Whether the link to `peer` is part of the spanning tree.
@@ -974,14 +1020,20 @@ impl<S: Signer> Node<S> {
     /// destination's path rides along in the packet rather than being looked up
     /// here, so every node on the route measures against the same target.
     ///
-    /// Among the peers that qualify, the cheapest wins: the link's own cost
-    /// plus the walk left after crossing it. That sum is exactly what the
-    /// packet pays if it follows the tree from there, so it is an upper bound
-    /// on the real price, and weighing it is what stops a node posting a packet
-    /// down an expensive shortcut to save one cheap hop.
+    /// Among the peers that qualify, the one leaving the least walk to go
+    /// wins, and the cheaper link settles it when two leave the same.
+    ///
+    /// Those two numbers are known to different people, which is why they are
+    /// weighed in that order. The walk left to go is read off paths every node
+    /// on the route holds and counts identically, so it is the part that has
+    /// to decide. The price is this node's own measurement of its own link,
+    /// which nobody else can check and nobody else needs to: it chooses
+    /// between hops that were going to make the same progress anyway, so a
+    /// node whose prices are asymmetric, stale or simply wrong sends a packet
+    /// a different equally good way and no further than that.
     fn next_hop(&self, dst_path: &[Hop]) -> Option<PublicKey> {
         let here = distance(self.announcement.path(), dst_path);
-        let mut best: Option<(u64, PublicKey)> = None;
+        let mut best: Option<(usize, Cost, PublicKey)> = None;
         for (&peer, state) in &self.peers {
             let Some(info) = self.info(&peer) else {
                 continue;
@@ -990,13 +1042,43 @@ impl<S: Signer> Node<S> {
             if remaining >= here {
                 continue;
             }
-            let total = state.cost.get().saturating_add(remaining);
-            if best.is_none_or(|(cheapest, _)| total < cheapest) {
-                best = Some((total, peer));
+            // The key is in there last so that two equally near, equally
+            // priced peers are not chosen between by chance.
+            let offer = (remaining, state.cost, peer);
+            if best.is_none_or(|standing| offer < standing) {
+                best = Some(offer);
             }
         }
-        best.map(|(_, peer)| peer)
+        best.map(|(_, _, peer)| peer)
     }
+}
+
+/// Where a node would rather sit, smallest first: the position `candidate`
+/// describes, reached over a link this node prices at `cost`.
+///
+/// Smallest root key wins, so that the network agrees on one root; then the
+/// fewest hops to it, which is what a position is worth to everybody else;
+/// then the cheaper link into it, which is what it is worth to this node;
+/// then the smallest path, so that whatever is left over is settled the same
+/// way everywhere and the tree has a single fixed point.
+///
+/// The price sits where it does because of who can see it. The two rules above
+/// it are read straight off the walks, so any node weighing the same pair
+/// weighs them the same way; the price is one node's measurement of one of its
+/// own links, and it decides only between two places that were equally good by
+/// every shared rule. A node's parent is its own business, and the worst a
+/// mismeasured link can do is leave that node exactly as near the root as it
+/// would have been anyway, by a slower road than it need have taken.
+///
+/// Two candidates always differ by the key of some hop before anything a stamp
+/// could reach, so the ordering does not move when a sequence number does.
+fn rank(candidate: &Announcement, cost: Option<Cost>) -> (PublicKey, usize, Option<Cost>, &[Hop]) {
+    (
+        candidate.root(),
+        candidate.path().len(),
+        cost,
+        candidate.path(),
+    )
 }
 
 #[cfg(test)]
@@ -1015,16 +1097,16 @@ mod tests {
     }
 
     fn cost(n: u64) -> Cost {
-        Cost::new(n).expect("a test cost is never zero")
+        Cost::new(n)
     }
 
     /// An announcement for the node at the end of `root` + `steps`, each hop
     /// signed by the node that added it and consented to by the one above.
-    fn announcement(root: u8, steps: &[(u8, u64)]) -> Announcement {
+    fn announcement(root: u8, steps: &[u8]) -> Announcement {
         let mut announcement = Announcement::root_of(&signer(root), 0);
         let mut above = root;
-        for &(node, price) in steps {
-            let consent = Consent::issue(&signer(above), key(node), cost(price));
+        for &node in steps {
+            let consent = Consent::issue(&signer(above), key(node));
             announcement = announcement
                 .extend(&signer(node), &consent, 0)
                 .expect("the test path holds distinct keys");
@@ -1033,23 +1115,23 @@ mod tests {
         announcement
     }
 
-    fn path(root: u8, steps: &[(u8, u64)]) -> Vec<Hop> {
+    fn path(root: u8, steps: &[u8]) -> Vec<Hop> {
         announcement(root, steps).path().to_vec()
     }
 
     /// The walk a path describes, with the stamps and signatures set aside.
-    fn walk(path: &[Hop]) -> Vec<(PublicKey, u64)> {
-        path.iter().map(|hop| (hop.key, hop.cost)).collect()
+    fn walk(path: &[Hop]) -> Vec<PublicKey> {
+        path.iter().map(|hop| hop.key).collect()
     }
 
     /// What the node at the end of `root` + `steps` says about itself.
-    fn announce(root: u8, steps: &[(u8, u64)]) -> Message {
+    fn announce(root: u8, steps: &[u8]) -> Message {
         Message::Announce(announcement(root, steps))
     }
 
-    /// `parent` agreeing to carry `child` over a link it prices at `price`.
-    fn consent_from(parent: u8, child: u8, price: u64) -> Message {
-        Message::Consent(Consent::issue(&signer(parent), key(child), cost(price)))
+    /// `parent` agreeing to carry `child`.
+    fn consent_from(parent: u8, child: u8) -> Message {
+        Message::Consent(Consent::issue(&signer(parent), key(child)))
     }
 
     fn nonce(n: u8) -> Nonce {
@@ -1058,7 +1140,7 @@ mod tests {
 
     /// An answer to a search, signed over `nonce` by the node it describes,
     /// with `trail` as what is left of its way home.
-    fn answer(seed: u8, trail: &[u8], root: u8, steps: &[(u8, u64)]) -> Message {
+    fn answer(seed: u8, trail: &[u8], root: u8, steps: &[u8]) -> Message {
         let announcement = announcement(root, steps);
         Message::Found(Found::answer(
             &StandIn::for_key(announcement.author()),
@@ -1071,7 +1153,7 @@ mod tests {
     /// The answer to a search `node` really made, arriving back home.
     ///
     /// It asks first, because an answer to a question nobody put is not one.
-    fn found(node: &mut Node<StandIn>, root: u8, steps: &[(u8, u64)]) -> Message {
+    fn found(node: &mut Node<StandIn>, root: u8, steps: &[u8]) -> Message {
         let target = announcement(root, steps).author();
         node.lookup(0, target, nonce(0));
         answer(0, &[node.key().as_bytes()[0]], root, steps)
@@ -1090,7 +1172,7 @@ mod tests {
     fn node_below_a_peer(now: u64) -> Node<StandIn> {
         let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
         node.add_peer(0, key(1), Cost::UNIT);
-        node.handle(now, key(1), consent_from(1, 2, 1));
+        node.handle(now, key(1), consent_from(1, 2));
         node.handle(now, key(1), announce(1, &[]));
         node
     }
@@ -1101,10 +1183,10 @@ mod tests {
         let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
         node.add_peer(0, key(1), Cost::UNIT);
         node.add_peer(0, key(3), Cost::UNIT);
-        node.handle(0, key(1), consent_from(1, 2, 1));
-        node.handle(0, key(3), consent_from(3, 2, 1));
+        node.handle(0, key(1), consent_from(1, 2));
+        node.handle(0, key(3), consent_from(3, 2));
         node.handle(0, key(1), announce(1, &[]));
-        node.handle(0, key(3), announce(1, &[(2, 1), (3, 1)]));
+        node.handle(0, key(3), announce(1, &[2, 3]));
         node.handle(0, key(3), Message::Summary(summary_of(&[3, 7])));
         node
     }
@@ -1147,8 +1229,8 @@ mod tests {
         );
         assert_eq!(
             out[1].message,
-            Message::Consent(Consent::issue(&signer(2), key(1), Cost::UNIT)),
-            "priced at what this node measured, since it is the one carrying"
+            Message::Consent(Consent::issue(&signer(2), key(1))),
+            "agreement to carry it, and no number attached"
         );
     }
 
@@ -1162,40 +1244,38 @@ mod tests {
         assert_eq!(node.root(), key(2), "so it is still its own root");
         assert_eq!(node.consent_from(key(1)), None);
 
-        node.handle(0, key(1), consent_from(1, 2, 1));
+        node.handle(0, key(1), consent_from(1, 2));
         assert_eq!(node.parent(), Some(key(1)), "now it is");
     }
 
     #[test]
-    fn a_node_announces_the_price_its_parent_named() {
-        // Both ends measured the link and disagreed about it. What the child
-        // announces is the parent's number, because the parent is the one
-        // that has to carry the traffic — a child free to pick would pick
-        // nothing, and advertise the cheapest walk in the neighbourhood.
+    fn a_position_says_nothing_about_what_a_link_costs() {
+        // Both ends measured the link and disagreed about it, and neither
+        // number goes anywhere: what a node announces is where it sits, which
+        // is a list of nodes. Each end keeps its own measurement for its own
+        // decisions, so there is nothing here for them to fall out over.
         let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
         node.add_peer(0, key(1), cost(1));
-        node.handle(0, key(1), consent_from(1, 2, 9));
+        node.handle(0, key(1), consent_from(1, 2));
         node.handle(0, key(1), announce(1, &[]));
 
-        assert_eq!(node.cost_to_root(), 9, "the parent's price, not its own");
-        assert_eq!(walk(node.path()), [(key(1), 0), (key(2), 9)]);
+        assert_eq!(node.depth(), 1, "one link from the root, at any price");
+        assert_eq!(walk(node.path()), [key(1), key(2)]);
     }
 
     #[test]
-    fn re_pricing_a_link_offers_the_peer_a_new_bargain() {
-        let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
-        node.add_peer(0, key(1), Cost::UNIT);
+    fn re_pricing_a_link_is_said_to_nobody() {
+        // The caller has measured the link again and found it ten times worse.
+        // With one peer there is nowhere else to go, so nothing about this node
+        // has changed as far as the network is concerned — and a price on its
+        // own was never news, because nobody else was ever told the old one.
+        let mut node = node_below_a_peer(0);
+        let before = node.path().to_vec();
 
         let out = node.add_peer(1, key(1), cost(10));
 
-        assert_eq!(
-            out,
-            vec![Envelope {
-                to: key(1),
-                message: Message::Consent(Consent::issue(&signer(2), key(1), cost(10))),
-            }],
-            "the price is part of what was agreed, so it is agreed again"
-        );
+        assert!(out.is_empty(), "a price is this node's own affair");
+        assert_eq!(node.path(), before);
     }
 
     #[test]
@@ -1222,7 +1302,7 @@ mod tests {
         let node = node_below_a_peer(0);
         assert_eq!(node.root(), key(1));
         assert_eq!(node.parent(), Some(key(1)));
-        assert_eq!(walk(node.path()), [(key(1), 0), (key(2), 1)]);
+        assert_eq!(walk(node.path()), [key(1), key(2)]);
     }
 
     #[test]
@@ -1245,7 +1325,7 @@ mod tests {
         // and now, out of what this node can see on its own.
         let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
         node.add_peer(0, key(3), Cost::UNIT);
-        node.handle(0, key(3), announce(1, &[(2, 1), (3, 1)]));
+        node.handle(0, key(3), announce(1, &[2, 3]));
 
         assert_eq!(node.root(), key(2), "a tree of one beats a cycle of two");
         assert_eq!(node.parent(), None);
@@ -1265,7 +1345,7 @@ mod tests {
         let mut node = node_below_a_peer(0);
         let before = node.path().to_vec();
 
-        node.handle(1, key(1), answer(0, &[2], 1, &[(9, 1), (2, 1)]));
+        node.handle(1, key(1), answer(0, &[2], 1, &[9, 2]));
 
         assert_eq!(node.path(), before, "still where it put itself");
         assert!(!node.known().any(|known| known == key(2)));
@@ -1280,7 +1360,7 @@ mod tests {
         // into is the only thing a node holds that grows with use.
         let mut node = middle_of_a_line();
 
-        let out = node.handle(0, key(3), answer(0, &[2], 1, &[(2, 1), (3, 1), (7, 1)]));
+        let out = node.handle(0, key(3), answer(0, &[2], 1, &[2, 3, 7]));
 
         assert!(out.is_empty());
         assert!(!node.known().any(|known| known == key(7)));
@@ -1296,7 +1376,7 @@ mod tests {
         let mut node = middle_of_a_line();
         node.lookup(0, key(7), nonce(0));
 
-        node.handle(0, key(3), answer(0, &[2], 1, &[(2, 1), (3, 1), (9, 1)]));
+        node.handle(0, key(3), answer(0, &[2], 1, &[2, 3, 9]));
 
         assert!(!node.known().any(|known| known == key(9)));
     }
@@ -1309,7 +1389,7 @@ mod tests {
         let mut node = middle_of_a_line();
         node.lookup(0, key(7), nonce(1));
 
-        let out = node.handle(0, key(3), answer(0, &[2], 1, &[(2, 1), (3, 1), (7, 1)]));
+        let out = node.handle(0, key(3), answer(0, &[2], 1, &[2, 3, 7]));
 
         assert!(out.is_empty(), "no nonce of this node's matches it");
         assert!(!node.known().any(|known| known == key(7)));
@@ -1319,7 +1399,7 @@ mod tests {
     fn an_answer_serves_the_one_search_that_asked_for_it() {
         let mut node = middle_of_a_line();
         node.lookup(0, key(7), nonce(0));
-        node.handle(0, key(3), answer(0, &[2], 1, &[(2, 1), (3, 1), (7, 1)]));
+        node.handle(0, key(3), answer(0, &[2], 1, &[2, 3, 7]));
         assert!(node.known().any(|known| known == key(7)));
 
         node.tick(Timing::MILLISECONDS.expiry);
@@ -1330,7 +1410,7 @@ mod tests {
         node.handle(
             Timing::MILLISECONDS.expiry,
             key(3),
-            answer(0, &[2], 1, &[(2, 1), (3, 1), (7, 1)]),
+            answer(0, &[2], 1, &[2, 3, 7]),
         );
         assert!(!node.known().any(|known| known == key(7)));
     }
@@ -1344,7 +1424,7 @@ mod tests {
         node.handle(
             Timing::MILLISECONDS.expiry,
             key(3),
-            answer(0, &[2], 1, &[(2, 1), (3, 1), (7, 1)]),
+            answer(0, &[2], 1, &[2, 3, 7]),
         );
 
         assert!(
@@ -1358,7 +1438,7 @@ mod tests {
         let mut node = node_below_a_peer(0);
         // The peer describing some third node. Nothing relays announcements,
         // so this could only be a mistake or a lie.
-        assert!(node.handle(0, key(1), announce(1, &[(9, 1)])).is_empty());
+        assert!(node.handle(0, key(1), announce(1, &[9])).is_empty());
         assert_eq!(
             node.known().collect::<Vec<_>>(),
             vec![key(1)],
@@ -1381,11 +1461,12 @@ mod tests {
         let mut node = Node::new(0, signer(3), Timing::MILLISECONDS);
         node.add_peer(0, key(2), Cost::UNIT);
 
-        // 2's genuine announcement, with the price of its link to the root
-        // rubbed out and a cheaper one written in. That would make 2 a better
-        // parent than it has earned, and cost every packet routed through it.
-        let mut tampered = path(1, &[(2, 5)]);
-        tampered[1].cost = 1;
+        // 2's genuine announcement, with the hop above it cut out. That would
+        // put 2 one link from the root instead of two, making it a better
+        // parent than it has earned and pulling towards it every packet
+        // routed by the walk it claims.
+        let mut tampered = path(1, &[9, 2]);
+        tampered.remove(1);
 
         let out = node.handle(
             0,
@@ -1414,7 +1495,7 @@ mod tests {
 
         // 3 hands over the agreement 1 gave to this node. It checks out
         // perfectly — it just is not 3 agreeing to carry anybody.
-        node.handle(0, key(3), consent_from(1, 2, 1));
+        node.handle(0, key(3), consent_from(1, 2));
 
         assert_eq!(
             node.take_evicted(),
@@ -1432,7 +1513,7 @@ mod tests {
         node.add_peer(0, key(3), Cost::UNIT);
 
         // 3 really did sign this, and it really is 3's to give — to 9.
-        node.handle(0, key(3), consent_from(3, 9, 1));
+        node.handle(0, key(3), consent_from(3, 9));
 
         assert_eq!(
             node.take_evicted(),
@@ -1451,7 +1532,7 @@ mod tests {
         let mut node = middle_of_a_line();
         assert_eq!(node.parent(), Some(key(1)));
 
-        let out = node.handle(0, key(1), announce(1, &[(9, 1)]));
+        let out = node.handle(0, key(1), announce(1, &[9]));
 
         assert_eq!(node.parent(), None, "its parent is gone");
         assert_eq!(node.root(), key(2));
@@ -1468,10 +1549,10 @@ mod tests {
         let mut node = middle_of_a_line();
 
         node.handle(0, key(1), announce(1, &[]));
-        node.handle(0, key(3), announce(1, &[(2, 1), (3, 1)]));
+        node.handle(0, key(3), announce(1, &[2, 3]));
         node.handle(0, key(3), Message::Summary(summary_of(&[3, 7])));
-        node.handle(0, key(1), consent_from(1, 2, 1));
-        node.handle(0, key(3), answer(9, &[2], 1, &[(2, 1), (3, 1), (7, 1)]));
+        node.handle(0, key(1), consent_from(1, 2));
+        node.handle(0, key(3), answer(9, &[2], 1, &[2, 3, 7]));
         node.tick(Timing::MILLISECONDS.expiry);
 
         assert!(
@@ -1485,9 +1566,10 @@ mod tests {
         let mut node = middle_of_a_line();
 
         // A search for 7 comes back with 7 placed somewhere it never signed
-        // for — the cheapest lie a node relaying an answer could tell.
-        let mut tampered = path(1, &[(2, 1), (3, 1), (7, 1)]);
-        tampered[3].cost = 9;
+        // for — nearer the root than it really is, which is the cheapest lie
+        // a node relaying an answer could tell.
+        let mut tampered = path(1, &[2, 3, 7]);
+        tampered.remove(2);
 
         let forged = Announcement::unchecked(tampered);
         let bad = Found::answer(
@@ -1519,7 +1601,7 @@ mod tests {
     fn a_stale_announcement_changes_nothing() {
         let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
         node.add_peer(0, key(1), Cost::UNIT);
-        node.handle(0, key(1), consent_from(1, 2, 1));
+        node.handle(0, key(1), consent_from(1, 2));
 
         let fresh = Announcement::root_of(&signer(1), 5);
         assert!(!node.handle(0, key(1), Message::Announce(fresh)).is_empty());
@@ -1577,7 +1659,7 @@ mod tests {
         // every node on the route measuring against the same target.
         let mut node = middle_of_a_line();
         let traffic = Traffic {
-            dst_path: path(1, &[(2, 1), (3, 1)]),
+            dst_path: path(1, &[2, 3]),
             packet: Packet {
                 src: key(1),
                 dst: key(3),
@@ -1628,7 +1710,7 @@ mod tests {
             0,
             key(1),
             Message::Traffic(Traffic {
-                dst_path: path(1, &[(2, 1), (3, 1)]),
+                dst_path: path(1, &[2, 3]),
                 packet: Packet {
                     src: key(1),
                     dst: key(3),
@@ -1666,7 +1748,7 @@ mod tests {
             0,
             key(1),
             Message::Traffic(Traffic {
-                dst_path: path(1, &[(2, 1)]),
+                dst_path: path(1, &[2]),
                 packet: Packet {
                     src: key(1),
                     dst: key(2),
@@ -1698,7 +1780,7 @@ mod tests {
             0,
             key(1),
             Message::Traffic(Traffic {
-                dst_path: path(1, &[(2, 1)]),
+                dst_path: path(1, &[2]),
                 packet: packet.clone(),
             }),
         );
@@ -1721,7 +1803,7 @@ mod tests {
             0,
             key(1),
             Message::Traffic(Traffic {
-                dst_path: path(1, &[(2, 1), (3, 1)]),
+                dst_path: path(1, &[2, 3]),
                 packet: Packet {
                     src: key(1),
                     dst: key(3),
@@ -1739,22 +1821,22 @@ mod tests {
 
     #[test]
     fn a_peer_exactly_as_far_away_is_not_progress() {
-        // 3 has not caught up: it still announces itself below this node,
-        // which has since gone off on its own. Measured against 4's
-        // coordinates, the two of them are the same distance away — and being
-        // no worse is not the test. Handing the packet over on equal terms is
-        // how it comes straight back, and it is only strictness that keeps
-        // the distance falling at every hop.
+        // Nobody here agrees about the root: this node and 3 each believe
+        // they are one, and the walk that came back for 4 belongs to a third.
+        // Measured against 4's coordinates the two of them come out exactly as
+        // far away as each other — and being no worse is not the test. Handing
+        // the packet over on equal terms is how it comes straight back, and it
+        // is only strictness that keeps the distance falling at every hop.
         let mut node = Node::new(0, signer(2), Timing::MILLISECONDS);
         node.add_peer(0, key(3), Cost::UNIT);
-        node.handle(0, key(3), announce(1, &[(2, 1), (3, 1)]));
-        let answer = found(&mut node, 1, &[(2, 1), (4, 1)]);
+        node.handle(0, key(3), announce(3, &[]));
+        let answer = found(&mut node, 1, &[4]);
         node.handle(0, key(3), answer);
 
-        assert_eq!(node.root(), key(2), "this node sits outside that walk now");
+        assert_eq!(node.root(), key(2), "and 3 is off in a tree of its own");
         assert_eq!(
-            distance(node.path(), &path(1, &[(2, 1), (4, 1)])),
-            distance(&path(1, &[(2, 1), (3, 1)]), &path(1, &[(2, 1), (4, 1)])),
+            distance(node.path(), &path(1, &[4])),
+            distance(&path(3, &[]), &path(1, &[4])),
             "a dead heat, which is the case the rule is strict about"
         );
         assert_eq!(node.send(key(4), b"hi".to_vec()), Err(SendError::NoRoute));
@@ -1767,7 +1849,7 @@ mod tests {
         // itself, so there is no hop that makes progress. Saying so beats
         // posting the packet to a peer that would only drop it.
         let mut node = node_below_a_peer(0);
-        let answer = found(&mut node, 1, &[(2, 1), (4, 1)]);
+        let answer = found(&mut node, 1, &[2, 4]);
         node.handle(0, key(1), answer);
         assert!(node.known().any(|known| known == key(4)));
 
@@ -1832,9 +1914,9 @@ mod tests {
     fn a_looked_up_position_is_forgotten_like_any_other() {
         let mut node = Node::new(0, signer(5), Timing::MILLISECONDS);
         node.add_peer(0, key(2), Cost::UNIT);
-        node.handle(0, key(2), consent_from(2, 5, 1));
-        node.handle(0, key(2), announce(1, &[(2, 1)]));
-        let answer = found(&mut node, 1, &[(2, 1), (4, 1)]);
+        node.handle(0, key(2), consent_from(2, 5));
+        node.handle(0, key(2), announce(1, &[2]));
+        let answer = found(&mut node, 1, &[2, 4]);
         node.handle(0, key(2), answer);
         assert!(node.known().any(|known| known == key(4)));
 
@@ -1867,7 +1949,7 @@ mod tests {
             Message::Announce(Announcement::root_of(&signer(1), 1)),
             "the same walk, signed afresh for a new sequence number"
         );
-        assert_eq!(walk(node.path()), [(key(1), 0)], "the tree did not move");
+        assert_eq!(walk(node.path()), [key(1)], "the tree did not move");
     }
 
     #[test]
@@ -1903,7 +1985,7 @@ mod tests {
         };
         let mut node = Node::new(0, signer(2), timing);
         node.add_peer(0, key(1), Cost::UNIT);
-        node.handle(0, key(1), consent_from(1, 2, 1));
+        node.handle(0, key(1), consent_from(1, 2));
         node.handle(0, key(1), announce(1, &[]));
 
         node.tick(39);
@@ -1913,48 +1995,112 @@ mod tests {
     }
 
     #[test]
-    fn a_node_sits_below_whichever_peer_offers_the_cheapest_walk_to_the_root() {
+    fn a_node_sits_below_whichever_peer_offers_the_shortest_walk_to_the_root() {
+        // The root is a peer, over a link this node measures at ten times what
+        // the other one costs. It sits below the root anyway: how near the
+        // root a walk is, everybody can read off the walk and agree about,
+        // and that is the part a position is chosen by.
         let mut node = Node::new(0, signer(4), Timing::MILLISECONDS);
         node.add_peer(0, key(1), cost(10));
         node.add_peer(0, key(2), cost(1));
-        node.handle(0, key(1), consent_from(1, 4, 10));
-        node.handle(0, key(2), consent_from(2, 4, 1));
+        node.handle(0, key(1), consent_from(1, 4));
+        node.handle(0, key(2), consent_from(2, 4));
         node.handle(0, key(1), announce(1, &[]));
-        node.handle(0, key(2), announce(1, &[(2, 1)]));
+        node.handle(0, key(2), announce(1, &[2]));
 
         assert_eq!(node.root(), key(1));
-        assert_eq!(
-            node.parent(),
-            Some(key(2)),
-            "two cheap links beat one expensive one, though the root is a peer"
-        );
-        assert_eq!(walk(node.path()), [(key(1), 0), (key(2), 1), (key(4), 1)]);
-        assert_eq!(node.cost_to_root(), 2);
+        assert_eq!(node.parent(), Some(key(1)));
+        assert_eq!(walk(node.path()), [key(1), key(4)]);
+        assert_eq!(node.depth(), 1);
+    }
+
+    /// A node holding key 4, offered a place below either of the root's two
+    /// children, over links it prices at `to_two` and `to_three`.
+    fn node_between_two_parents(to_two: u64, to_three: u64) -> Node<StandIn> {
+        let mut node = Node::new(0, signer(4), Timing::MILLISECONDS);
+        node.add_peer(0, key(2), cost(to_two));
+        node.add_peer(0, key(3), cost(to_three));
+        node.handle(0, key(2), consent_from(2, 4));
+        node.handle(0, key(3), consent_from(3, 4));
+        node.handle(0, key(2), announce(1, &[2]));
+        node.handle(0, key(3), announce(1, &[3]));
+        node
     }
 
     #[test]
-    fn a_peer_re_pricing_its_side_moves_a_node() {
-        let mut node = Node::new(0, signer(4), Timing::MILLISECONDS);
-        node.add_peer(0, key(1), Cost::UNIT);
-        node.add_peer(0, key(2), Cost::UNIT);
-        node.handle(0, key(1), consent_from(1, 4, 1));
-        node.handle(0, key(2), consent_from(2, 4, 1));
-        node.handle(0, key(1), announce(1, &[]));
-        node.handle(0, key(2), announce(1, &[(2, 1)]));
-        assert_eq!(node.parent(), Some(key(1)), "one hop to the root");
+    fn the_cheaper_link_settles_which_of_two_equally_good_parents_wins() {
+        // Both offers are the same walk length to the same root, so every rule
+        // the rest of the network shares has run out. What is left is the one
+        // thing this node knows and nobody else does: what its own two links
+        // cost it.
+        let node = node_between_two_parents(10, 1);
 
-        // The root measures that link again and finds it much worse, so the
-        // bargain it is offering changes. The price is the parent's to set,
-        // and a node cannot go on announcing one it is no longer being
-        // offered, because the price is part of what was signed.
-        let out = node.handle(1, key(1), consent_from(1, 4, 10));
+        assert_eq!(node.parent(), Some(key(3)));
+        assert_eq!(node.depth(), 2);
+        assert_eq!(
+            node_between_two_parents(1, 10).parent(),
+            Some(key(2)),
+            "and the other way round when the prices are"
+        );
+    }
 
-        assert_eq!(node.parent(), Some(key(2)), "the long way round is cheaper");
-        assert_eq!(node.cost_to_root(), 2);
+    #[test]
+    fn a_smaller_root_outweighs_any_price() {
+        // The rule the whole network has to agree on comes first, and it is
+        // not open to being outbid: a walk to a smaller root wins however dear
+        // the link into it and however long the walk.
+        let free = Some(Cost::new(0));
+        let dear = Some(Cost::new(u64::MAX));
+        let low_root = announcement(1, &[9, 5]);
+        let high_root = announcement(2, &[5]);
+
+        assert!(rank(&low_root, dear) < rank(&high_root, free));
+    }
+
+    #[test]
+    fn rank_breaks_a_dead_heat_on_the_walk_itself() {
+        // Same root, same length, same price, and still one of them has to
+        // win. What it settles on matters less than that it settles: this is
+        // the last tie-break, and without it a node could sit between two
+        // positions swapping one for the other.
+        let through_three = announcement(1, &[3, 5]);
+        let through_four = announcement(1, &[4, 5]);
+        let same = Some(Cost::UNIT);
+
+        assert!(rank(&through_three, same) < rank(&through_four, same));
+        assert!(rank(&through_four, same) > rank(&through_three, same));
+    }
+
+    #[test]
+    fn rank_does_not_move_when_a_sequence_number_does() {
+        // Two candidates always part company at some hop's key, which is
+        // compared before anything a restamp could reach. If they did not, a
+        // node would change its mind every time somebody above it reissued.
+        let left = announcement(1, &[3, 5]);
+        let right = announcement(1, &[4, 5]);
+        let same = Some(Cost::UNIT);
+        let before = rank(&left, same) < rank(&right, same);
+
+        let restamped = left.with_seq(&signer(5), 400).expect("the author");
+        assert_eq!(rank(&restamped, same) < rank(&right, same), before);
+    }
+
+    #[test]
+    fn re_pricing_a_link_moves_a_node_between_two_equals() {
+        let mut node = node_between_two_parents(10, 1);
+        assert_eq!(node.parent(), Some(key(3)));
+
+        // The caller measures its link to 3 again and finds it worse than the
+        // one it had preferred it to. Nobody told this node anything: it is
+        // its own measurement of its own link, and moving is what it does
+        // about it.
+        let out = node.add_peer(1, key(3), cost(20));
+
+        assert_eq!(node.parent(), Some(key(2)));
         assert_eq!(
             announces(&out),
-            vec![key(1), key(2)],
-            "both peers are told where this node moved to"
+            vec![key(2), key(3)],
+            "both peers are told where this node moved to, and neither is told why"
         );
     }
 
@@ -2030,18 +2176,27 @@ mod tests {
     }
 
     /// A node holding key 5, linked to both 2 and 3 — each of them a child of
-    /// the root — and told that 4 sits below 2, away from 3.
-    fn node_choosing_between_two_peers(to_two: u64, to_three: u64) -> Node<StandIn> {
+    /// the root — over links it prices at `to_two` and `to_three`, and told
+    /// where a node beyond one of them sits.
+    ///
+    /// `under` names the branch the destination hangs from, so the caller
+    /// decides whether one of the two peers is nearer it than the other or
+    /// whether both are equally far.
+    fn node_choosing_between_two_peers(
+        to_two: u64,
+        to_three: u64,
+        under: u8,
+    ) -> (Node<StandIn>, PublicKey) {
         let mut node = Node::new(0, signer(5), Timing::MILLISECONDS);
         node.add_peer(0, key(2), cost(to_two));
         node.add_peer(0, key(3), cost(to_three));
-        node.handle(0, key(2), consent_from(2, 5, to_two));
-        node.handle(0, key(3), consent_from(3, 5, to_three));
-        node.handle(0, key(2), announce(1, &[(2, 1)]));
-        node.handle(0, key(3), announce(1, &[(3, 1)]));
-        let answer = found(&mut node, 1, &[(2, 1), (4, 1)]);
+        node.handle(0, key(2), consent_from(2, 5));
+        node.handle(0, key(3), consent_from(3, 5));
+        node.handle(0, key(2), announce(1, &[2]));
+        node.handle(0, key(3), announce(1, &[3]));
+        let answer = found(&mut node, 1, &[under, 6]);
         node.handle(0, key(2), answer);
-        node
+        (node, key(6))
     }
 
     fn first_hop(out: &[Envelope]) -> PublicKey {
@@ -2049,29 +2204,29 @@ mod tests {
     }
 
     #[test]
-    fn a_packet_crosses_a_shortcut_only_while_it_is_worth_crossing() {
-        let mut cheap = node_choosing_between_two_peers(1, 2);
-        assert_eq!(cheap.parent(), Some(key(2)));
-        let out = cheap
-            .send(key(4), b"hi".to_vec())
-            .expect("a route is known");
-        assert_eq!(
-            first_hop(&out),
-            key(2),
-            "2 is one cheap hop from the destination"
-        );
+    fn a_packet_takes_the_shortest_way_whatever_the_link_costs() {
+        // 6 hangs off 2, and this node's link to 2 costs ten times its link to
+        // 3. It goes to 2 regardless: how much walk is left is the number
+        // every node on the route works out the same way, and it is what has
+        // to decide, since nobody past this hop has heard of the price.
+        let (mut node, six) = node_choosing_between_two_peers(10, 1, 2);
+        let out = node.send(six, b"hi".to_vec()).expect("a route is known");
 
-        // The same network with that one link made expensive. 2 is still the
-        // peer nearest the destination, but reaching it now costs more than
-        // walking the tree the long way round.
-        let mut dear = node_choosing_between_two_peers(10, 1);
-        assert_eq!(dear.parent(), Some(key(3)));
-        let out = dear.send(key(4), b"hi".to_vec()).expect("a route is known");
-        assert_eq!(
-            first_hop(&out),
-            key(3),
-            "three cheap hops beat one costing ten"
-        );
+        assert_eq!(first_hop(&out), key(2), "the peer nearest the destination");
+    }
+
+    #[test]
+    fn the_cheaper_link_settles_which_of_two_equally_good_hops_wins() {
+        // 6 hangs off 4, a third child of the root, so 2 and 3 are exactly as
+        // far from it as each other and both are nearer than this node. The
+        // shared rule has nothing left to say, and the price decides.
+        let (mut node, six) = node_choosing_between_two_peers(10, 1, 4);
+        let out = node.send(six, b"hi".to_vec()).expect("a route is known");
+        assert_eq!(first_hop(&out), key(3));
+
+        let (mut node, six) = node_choosing_between_two_peers(1, 10, 4);
+        let out = node.send(six, b"hi".to_vec()).expect("a route is known");
+        assert_eq!(first_hop(&out), key(2), "and the other way round");
     }
 
     #[test]
@@ -2102,7 +2257,7 @@ mod tests {
         // A fourth node, linked but sitting elsewhere in the tree: neither this
         // node's parent nor one of its children.
         node.add_peer(0, key(8), Cost::UNIT);
-        node.handle(0, key(8), announce(1, &[(6, 1), (8, 1)]));
+        node.handle(0, key(8), announce(1, &[6, 8]));
 
         assert_eq!(node.summary_for(key(8)), None);
         assert!(node.summary_for(key(1)).is_some());
@@ -2207,7 +2362,7 @@ mod tests {
             0,
             key(3),
             Message::Announce(
-                announcement(1, &[(6, 1), (3, 1)])
+                announcement(1, &[6, 3])
                     .with_seq(&signer(3), 1)
                     .expect("the author"),
             ),
@@ -2299,13 +2454,10 @@ mod tests {
         let mut node = middle_of_a_line();
 
         // Passing through: the trail still has the asker on it.
-        let out = node.handle(0, key(3), answer(0, &[1, 2], 1, &[(2, 1), (3, 1), (7, 1)]));
+        let out = node.handle(0, key(3), answer(0, &[1, 2], 1, &[2, 3, 7]));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].to, key(1));
-        assert_eq!(
-            out[0].message,
-            answer(0, &[1], 1, &[(2, 1), (3, 1), (7, 1)])
-        );
+        assert_eq!(out[0].message, answer(0, &[1], 1, &[2, 3, 7]));
         assert!(
             !node.known().any(|known| known == key(7)),
             "carrying an answer is not the same as having asked for it"
@@ -2314,7 +2466,7 @@ mod tests {
         // Arriving home: nothing before this node on the trail, and a
         // question of its own that this answers.
         node.lookup(0, key(7), nonce(0));
-        let out = node.handle(0, key(3), answer(0, &[2], 1, &[(2, 1), (3, 1), (7, 1)]));
+        let out = node.handle(0, key(3), answer(0, &[2], 1, &[2, 3, 7]));
         assert!(out.is_empty(), "the answer goes no further");
         assert!(node.known().any(|known| known == key(7)));
         assert!(node.send(key(7), b"found you".to_vec()).is_ok());
@@ -2323,7 +2475,7 @@ mod tests {
     #[test]
     fn an_answer_that_never_came_through_here_is_dropped() {
         let mut node = middle_of_a_line();
-        let out = node.handle(0, key(3), answer(0, &[1, 8], 1, &[(2, 1), (3, 1), (7, 1)]));
+        let out = node.handle(0, key(3), answer(0, &[1, 8], 1, &[2, 3, 7]));
         assert!(out.is_empty());
         assert!(!node.known().any(|known| known == key(7)));
     }

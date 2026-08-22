@@ -1,7 +1,9 @@
 <script>
   // The network drawn as a graph: nodes on a circle, links between them.
   // Tree links (a node and its parent) are solid, every other link is dashed,
-  // and each carries the cost of crossing it.
+  // and each carries what it costs to cross — a number both ends of it happen
+  // to agree on here because this simulator sets both, and one that no node
+  // ever puts on the wire.
   let { nodes, links, selected, flight, search, summaryBits, onpick } = $props();
 
   const WIDTH = 760;

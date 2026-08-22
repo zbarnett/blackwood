@@ -20,23 +20,31 @@
 //! can be dropped on sight rather than reasoned about.
 //!
 //! Given two announcements, the distance between their authors is the walk up
-//! to their lowest common ancestor and back down. A node forwards a packet to
-//! whichever peer stands strictly closer to the destination than it does. Two
-//! properties fall out of that rule, both of them local:
+//! to their lowest common ancestor and back down, counted in links. A node
+//! forwards a packet to whichever peer stands strictly closer to the
+//! destination than it does. Two properties fall out of that rule, both of
+//! them local:
 //!
 //! - **Loop freedom.** Distance strictly decreases at every hop and is bounded
 //!   below by zero, so a packet cannot revisit a node.
 //! - **Delivery on a settled tree.** A node's tree neighbour towards the
-//!   destination is always closer by exactly what the link between them costs,
-//!   so a node with a consistent view always has a next hop to offer.
+//!   destination is always exactly one link closer, so a node with a
+//!   consistent view always has a next hop to offer.
 //!
-//! Every link costs something to cross — latency, in ironwood's case, and
-//! whatever the caller measures here — and both decisions weigh it. A node sits
-//! below the peer offering the cheapest walk to the root rather than the
-//! shortest one, and among the peers that make strict progress it hands a
-//! packet to whichever leaves the least left to pay. A [`Cost`] is never zero,
-//! which is what keeps both of the properties above standing; a network whose
-//! links all cost [`Cost::UNIT`] measures distance in hops.
+//! Both of those numbers are counts of links, derived from paths that everyone
+//! reads the same way. What a link *costs* to cross — latency, in ironwood's
+//! case, and whatever the caller measures here — is a separate matter, and a
+//! purely local one: a node prices its own links, and a [`Cost`] is never
+//! announced, never signed and never quoted at anybody. It breaks ties. Among
+//! the peers offering equally short walks to the root a node sits below the
+//! one it can reach most cheaply, and among the peers that leave a packet the
+//! same distance to travel it hands the packet to the cheapest.
+//!
+//! Keeping the price out of the shared metric is what makes it free to be
+//! wrong. Nothing adds it up, so it cannot be inflated to swamp a sum; the two
+//! ends of a link need not agree on it; and a caller that re-measures every
+//! second sends nothing at all, because a price it changes its mind about is
+//! news to nobody.
 //!
 //! The destination's path travels in the packet, since no node along the way
 //! holds it. That is also what makes the first property exact rather than
@@ -112,22 +120,21 @@
 //!
 //! Every hop of an announcement carries two signatures: the node it names,
 //! over that hop and over every hop above it exactly as they stand, and the
-//! node in the hop above, over this one's key and the price of the link
-//! between them. A walk down the tree is therefore a chain of bargains, each
-//! struck by the two nodes it joins. Nobody can put a node somewhere it has
-//! not put itself, nobody can put itself somewhere it has not been invited,
-//! and no part of one announcement can be lifted into another.
+//! node in the hop above, over this one's key. A walk down the tree is
+//! therefore a chain of bargains, each struck by the two nodes it joins.
+//! Nobody can put a node somewhere it has not put itself, nobody can put
+//! itself somewhere it has not been invited, and no part of one announcement
+//! can be lifted into another.
 //!
 //! That matters most for a node that is lying. A position is the one thing a
 //! node says that is really about two nodes, and it is the profitable thing to
-//! lie about: a node claiming a link it does not have, priced at nothing, is
-//! claiming the cheapest walk to the root in the neighbourhood, and its peers
-//! will sit below it because that is exactly what the rule tells them to do.
-//! The nodes it collects are then unreachable, because the walk everyone is
-//! routing them by runs through a link that does not exist — and the packets
-//! die at whoever is named on the far end of it, who has no idea why. Consent
-//! is what closes that: the price is the parent's, so it cannot be understated
-//! either.
+//! lie about: a node claiming a link it does not have is claiming a shorter
+//! walk to the root than it has any right to, and its peers will sit below it
+//! because that is exactly what the rule tells them to do. The nodes it
+//! collects are then unreachable, because the walk everyone is routing them by
+//! runs through a link that does not exist — and the packets die at whoever is
+//! named on the far end of it, who has no idea why. Consent is what closes
+//! that: the link has two ends, and both of them have to sign.
 //!
 //! What signing still does not settle is *when*. A signature is as good on a
 //! long-dead announcement as on a fresh one, and a node hearing about another
@@ -200,7 +207,8 @@
 //! );
 //!
 //! // Bring up the link, then hand each side what the other offered. Nothing
-//! // has been measured about it, so it is priced at a single hop.
+//! // has been measured about it, so each end prices it at the default — a
+//! // number neither of them tells the other.
 //! let to_b = a_node.add_peer(0, b, Cost::UNIT);
 //! for envelope in b_node.add_peer(0, a, Cost::UNIT) {
 //!     a_node.handle(0, b, envelope.message);
@@ -216,7 +224,7 @@
 //! // The smaller key is the root, and the other sits one link below it.
 //! assert_eq!(b_node.root(), a);
 //! assert_eq!(b_node.parent(), Some(a));
-//! assert_eq!(b_node.cost_to_root(), 1);
+//! assert_eq!(b_node.depth(), 1);
 //!
 //! // A packet crosses the single hop. b is a's peer, so a already holds its
 //! // position; anywhere further would have to be found with `lookup` first.
@@ -250,7 +258,7 @@ pub use key::{KEY_LEN, PublicKey};
 pub use message::{
     Envelope, Found, Lookup, MAX_PAYLOAD_LEN, Message, NONCE_LEN, Nonce, Packet, Traffic,
 };
-pub use node::{Eviction, Fault, Node, SendError, Timing};
+pub use node::{Cost, Eviction, Fault, Node, SendError, Timing};
 pub use signature::{SIGNATURE_LEN, Signature, Signer};
 pub use summary::Summary;
-pub use tree::{Announcement, Consent, Cost, Hop, MalformedAnnouncement};
+pub use tree::{Announcement, Consent, Hop, MalformedAnnouncement};

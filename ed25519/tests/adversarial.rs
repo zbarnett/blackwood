@@ -122,12 +122,11 @@ impl Network {
     }
 }
 
-/// A line of `count` honest nodes, every link priced the same.
-fn line(count: u8, cost: u64) -> (Network, Vec<PublicKey>) {
-    let price = Cost::new(cost).expect("not zero");
+/// A line of `count` honest nodes.
+fn line(count: u8) -> (Network, Vec<PublicKey>) {
     let (mut net, keys) = Network::new(count);
     for i in 0..(count as usize - 1) {
-        net.link(keys[i], keys[i + 1], price);
+        net.link(keys[i], keys[i + 1], Cost::UNIT);
     }
     net.run();
     (net, keys)
@@ -139,13 +138,13 @@ fn attacker_at_the_edge(net: &mut Network, keys: &[PublicKey]) -> (Ed25519, Publ
     let mallory = Ed25519::from_seed([200; 32]);
     let victim = *keys
         .iter()
-        .max_by_key(|&&k| net.node(k).cost_to_root())
+        .max_by_key(|&&k| net.node(k).depth())
         .expect("the network is not empty");
     net.nodes.insert(
         mallory.key(),
         Node::new(0, Ed25519::from_seed([200; 32]), Timing::MILLISECONDS),
     );
-    net.link(victim, mallory.key(), Cost::new(5).expect("not zero"));
+    net.link(victim, mallory.key(), Cost::UNIT);
     net.run();
     (mallory, victim)
 }
@@ -153,19 +152,18 @@ fn attacker_at_the_edge(net: &mut Network, keys: &[PublicKey]) -> (Ed25519, Publ
 #[test]
 fn the_splice_that_captured_the_network_cannot_be_built() {
     // The attack that used to work: take the root's own genuine announcement,
-    // which any lookup answer hands out, and sign yourself onto the end of it
-    // over a link costing one. Every signature above is real. Only the last
-    // hop is new, and the attacker is entitled to sign that.
-    let (mut net, keys) = line(6, 5);
+    // which any lookup answer hands out, and sign yourself onto the end of it.
+    // Every signature above is real. Only the last hop is new, and the
+    // attacker is entitled to sign that.
+    let (mut net, keys) = line(6);
     let root = net.node(keys[0]).root();
     let (mallory, _) = attacker_at_the_edge(&mut net, &keys);
 
     let stolen = Announcement::new::<Ed25519>(net.node(root).path().to_vec()).expect("genuine");
-    let cheap = Cost::new(1).expect("not zero");
 
     // Nothing she can sign is the root agreeing to carry her.
     assert_eq!(
-        stolen.extend(&mallory, &Consent::issue(&mallory, mallory.key(), cheap), 1),
+        stolen.extend(&mallory, &Consent::issue(&mallory, mallory.key()), 1),
         None,
         "her own signature is not the root's"
     );
@@ -186,11 +184,11 @@ fn the_splice_that_captured_the_network_cannot_be_built() {
         );
     }
 
-    // And the position she is actually offered is her host's price, not one
-    // of her choosing.
+    // And the position she is actually offered is one link below the node
+    // that agreed to have her, not one of her choosing.
     let hers = net.node(mallory.key()).path();
-    assert_eq!(hers[hers.len() - 1].cost, 5);
-    assert!(hers.len() > 1, "she is welcome somewhere, at a price");
+    assert_eq!(hers.len(), net.node(root).path().len() + 5);
+    assert!(hers.len() > 1, "she is welcome somewhere, at the far end");
 }
 
 #[test]
@@ -204,7 +202,6 @@ fn a_forged_walk_cannot_even_be_named() {
     let mut path = Announcement::root_of(&victim, 0).path().to_vec();
     path.push(Hop {
         key: mallory.key(),
-        cost: 1,
         seq: 1,
         consent: Some(Signature::new([0; SIGNATURE_LEN])),
         signature: Signature::new([0; SIGNATURE_LEN]),
@@ -216,7 +213,6 @@ fn a_forged_walk_cannot_even_be_named() {
         Consent::new::<Ed25519>(
             victim.key(),
             mallory.key(),
-            Cost::UNIT,
             Signature::new([0; SIGNATURE_LEN]),
         ),
         None,
@@ -227,7 +223,7 @@ fn a_forged_walk_cannot_even_be_named() {
 fn the_network_stays_whole_with_an_attacker_on_the_edge() {
     // Before, one message from here made two of six nodes unreachable from
     // the root. Now the attacker is just a leaf.
-    let (mut net, keys) = line(6, 5);
+    let (mut net, keys) = line(6);
     let root = net.node(keys[0]).root();
     let (mallory, _) = attacker_at_the_edge(&mut net, &keys);
 
@@ -249,7 +245,7 @@ fn a_recorded_answer_is_not_an_answer() {
     // An announcement is as valid a year later as the day it was signed, so
     // an attacker that keeps one can offer it as an answer forever. What it
     // cannot keep is the asker's nonce.
-    let (mut net, keys) = line(5, 5);
+    let (mut net, keys) = line(5);
     let (asker, target) = (keys[0], keys[4]);
 
     net.answers.clear();
@@ -304,7 +300,7 @@ fn a_peer_can_still_declare_itself_a_tree_neighbour() {
     // sits below this node legitimately can still claim anything it likes
     // lies beyond it. What consent removed is its ability to sit anywhere it
     // was not invited — not its ability to lie about what it can see.
-    let (mut net, keys) = line(6, 5);
+    let (mut net, keys) = line(6);
     let (mallory, victim) = attacker_at_the_edge(&mut net, &keys);
 
     assert_eq!(
@@ -325,14 +321,12 @@ fn an_unbounded_path_is_still_expensive_to_refuse() {
     // scan before it is quadratic, which is what the shape below is.
     let bogus = Hop {
         key: PublicKey::new([7; 32]),
-        cost: 1,
         seq: 0,
         consent: Some(Signature::new([0; SIGNATURE_LEN])),
         signature: Signature::new([0; SIGNATURE_LEN]),
     };
     for n in [1_000usize, 10_000] {
         let mut path = vec![Hop {
-            cost: 0,
             consent: None,
             ..bogus
         }];

@@ -28,7 +28,7 @@ Click a node to select it, and a second node for the other end of an action.
 | --- | --- |
 | Add node | Adds an isolated node |
 | Remove node | Removes the first selected node and its links |
-| cost | What a new link costs to cross, and what **Re-price** sets one to |
+| cost | What a new link costs to cross, and what **Re-price** sets one to — a number each node keeps to itself |
 | Link / Unlink | Brings a link between the two selected nodes up or down |
 | Re-price | Re-measures the link between them at the cost in the box |
 | Look up | Asks the network where the second node sits, and rings every node the search passed through |
@@ -41,13 +41,17 @@ The root is ringed in gold, links to a node's parent are solid, every other link
 is dashed, and each carries what it costs to cross. After each change the
 simulator runs gossip to quiescence, so what you see is the settled tree.
 
-The network opens with one link priced at 5 and the rest at 1, so the tree that
-forms is the cheapest one rather than the shallowest: `4` reaches the root the
-long way round, by way of `3`, rather than over its own link to `2`. Select
-`2` and `4`, re-price that link to 1, and the tree snaps back — nothing crossed
-the network to make it happen, since a link's cost is something each end
-measures for itself. The *cost* column is what the walk from a node up to the
-root costs, and the log prices each packet the same way.
+The network opens with one link priced at 5 and the rest at 1. `2` and `3` are
+equally near the root, so nothing in the walks themselves settles which of them
+`4` should sit below; what settles it is that `4` measures its link to `3` at 1
+and its link to `2` at 5, and so `4` hangs off `3`. Select `3` and `4`,
+re-price that link to 9, and `4` changes sides — nothing crossed the network to
+make it happen, because a link's cost is something each end measures for itself
+and tells nobody. What travels is the move that follows.
+
+The *depth* column is how many links the walk from a node up to the root
+crosses, which is the number the tree is actually built on; the log still
+prices each packet, by adding up the links it really crossed.
 
 Each node signs with a real ed25519 key, and the *key* column shows the first
 three bytes of it. The root is the smallest of them, which is why the labels are

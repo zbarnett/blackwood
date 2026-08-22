@@ -63,19 +63,19 @@ fn signer(key: PublicKey) -> StandIn {
 }
 
 fn cost(n: u64) -> Cost {
-    Cost::new(n).expect("a test cost is never zero")
+    Cost::new(n)
 }
 
 /// Where one node believes it sits: the root it answers to, its parent, and
 /// the walk down to it.
-type Position = (PublicKey, Option<PublicKey>, Vec<(PublicKey, u64)>);
+type Position = (PublicKey, Option<PublicKey>, Vec<PublicKey>);
 
 /// The walk a path describes, with the stamps and signatures set aside.
 ///
 /// Two nodes holding differently stamped copies of the same walk are in the
 /// same place, and that is what these tests mean when they compare positions.
-fn walk(path: &[Hop]) -> Vec<(PublicKey, u64)> {
-    path.iter().map(|hop| (hop.key, hop.cost)).collect()
+fn walk(path: &[Hop]) -> Vec<PublicKey> {
+    path.iter().map(|hop| hop.key).collect()
 }
 
 /// A message in flight, from one node to a linked peer.
@@ -240,26 +240,26 @@ impl Network {
     }
 
     /// Checks the invariant greedy forwarding rests on: every node's path is
-    /// its parent's path with one hop more on the end, priced at what that
-    /// node measured the link to its parent to cost.
+    /// its parent's path with one hop more on the end, and that parent is a
+    /// node it really holds a link to.
     fn paths_agree_with_parents(&self, keys: &[PublicKey]) {
         for &key in keys {
             let node = self.node(key);
             let Some(parent) = node.parent() else {
-                assert_eq!(walk(node.path()), [(key, 0)], "a root's path is itself");
+                assert_eq!(walk(node.path()), [key], "a root's path is itself");
                 continue;
             };
-            let (_, cost) = node
-                .peers()
-                .find(|(peer, _)| *peer == parent)
-                .expect("a node's parent is one of its peers");
+            assert!(
+                node.peers().any(|(peer, _)| peer == parent),
+                "a node's parent is one of its peers"
+            );
             let (head, tail) = node.path().split_at(node.path().len() - 1);
             assert_eq!(
                 walk(head),
                 walk(self.node(parent).path()),
                 "path disagrees with parent"
             );
-            assert_eq!(walk(tail), [(key, cost.get())]);
+            assert_eq!(walk(tail), [key]);
         }
     }
 
@@ -307,28 +307,36 @@ fn ring_with_a_tail() -> (Network, [PublicKey; 5]) {
     (net, keys)
 }
 
-/// The same topology, with the `b - d` link made expensive:
+/// A tree with a choice in it, where the choice is not between walks of
+/// different lengths:
 ///
 /// ```text
-///     a -1- b -1- c
-///           |     |
-///           5     1
-///           |     |
-///           d --- +
-///           |
-///           1
-///           |
-///           e
+///        a
+///      / | \
+///     b  c  d
+///      \ /   \
+///       e     f
 /// ```
 ///
-/// Every shortest path by hop count still runs over `b - d`, and every cheapest
-/// one avoids it, so the two metrics disagree everywhere it matters.
-fn ring_with_one_expensive_link() -> (Network, [PublicKey; 5]) {
-    let keys = [key(1), key(2), key(3), key(4), key(5)];
-    let [a, b, c, d, e] = keys;
+/// `e` is linked to both `b` and `c`, which sit at the same depth below the
+/// same root, so every rule the whole network shares has run out by the time
+/// `e` comes to choose between them — and `f`, off under `d`, is exactly as
+/// far from `e` by way of one as by way of the other. What is left in both
+/// cases is what `e` measures its own two links to cost, which is what
+/// `to_b` and `to_c` set.
+fn two_ways_up(to_b: u64, to_c: u64) -> (Network, [PublicKey; 6]) {
+    let keys = [key(1), key(2), key(3), key(4), key(5), key(6)];
+    let [a, b, c, d, e, f] = keys;
 
     let mut net = Network::new(keys);
-    for (near, far, price) in [(a, b, 1), (b, c, 1), (c, d, 1), (b, d, 5), (d, e, 1)] {
+    for (near, far, price) in [
+        (a, b, 1),
+        (a, c, 1),
+        (a, d, 1),
+        (b, e, to_b),
+        (c, e, to_c),
+        (d, f, 1),
+    ] {
         net.link(near, far, cost(price));
     }
     (net, keys)
@@ -473,93 +481,98 @@ fn every_node_can_reach_every_other() {
 
 #[test]
 fn every_node_can_reach_every_other_over_priced_links() {
-    let (mut net, keys) = ring_with_one_expensive_link();
+    let (mut net, keys) = two_ways_up(5, 1);
     net.run();
     net.everyone_reaches_everyone(&keys);
 }
 
 #[test]
-fn the_cheapest_walk_wins_over_the_shortest_one() {
-    let (mut net, [a, b, c, d, e]) = ring_with_one_expensive_link();
+fn the_cheaper_link_settles_a_tie_between_two_parents() {
+    let (mut net, [a, b, c, _d, e, _f]) = two_ways_up(5, 1);
 
     net.run();
 
-    for node in [a, b, c, d, e] {
+    for node in [a, b, c, e] {
         assert_eq!(net.node(node).root(), a, "disagreement about the root");
     }
     assert_eq!(
-        net.node(d).parent(),
+        net.node(e).parent(),
         Some(c),
-        "one link costing 5 is worse than two costing 1 apiece"
+        "the two offers are the same walk, and this is the cheaper link into it"
     );
-    assert_eq!(net.node(d).cost_to_root(), 3);
-    assert_eq!(net.node(e).parent(), Some(d));
-    assert_eq!(net.node(e).cost_to_root(), 4);
-    net.paths_agree_with_parents(&[a, b, c, d, e]);
+    assert_eq!(net.node(e).depth(), 2);
+    net.paths_agree_with_parents(&[a, b, c, e]);
 
-    // The same packet the unit-cost network carries in three hops. Here it
-    // takes four, and pays 4 rather than the 7 the short way would have cost.
-    net.send(a, e, b"the long way round");
-
-    assert_eq!(
-        net.node_mut(e).take_delivered(),
-        vec![Packet {
-            src: a,
-            dst: e,
-            payload: b"the long way round".to_vec(),
-        }]
-    );
-    assert_eq!(net.hops, 4, "expected a -> b -> c -> d -> e");
+    // Nobody else has to know or agree: the number that moved e is e's own
+    // measurement of e's own link, and it never left the node.
+    let (mut swapped, _) = two_ways_up(1, 5);
+    swapped.run();
+    assert_eq!(swapped.node(e).parent(), Some(b));
+    assert_eq!(swapped.node(e).depth(), 2);
 }
 
 #[test]
-fn a_packet_refuses_an_expensive_shortcut() {
-    let (mut net, [_a, b, c, d, e]) = ring_with_one_expensive_link();
+fn a_packet_takes_the_cheaper_of_two_equally_good_ways() {
+    let (mut net, [_a, b, c, _d, e, f]) = two_ways_up(5, 1);
     net.run();
 
-    // b holds a link straight to d, which is one hop from the destination.
-    // Crossing it costs 5, where walking the tree by way of c costs 3.
-    assert!(net.node(b).peers().any(|(peer, _)| peer == d));
+    // b and c are exactly as far from f as each other, and both are nearer it
+    // than e is, so the shared rule admits either. The link to c costs a fifth
+    // of the link to b.
+    net.find(e, f);
+    let out = net
+        .node_mut(e)
+        .send(f, b"either way".to_vec())
+        .expect("a route is known");
+    assert_eq!(out[0].to, c, "equally good, and cheaper to reach");
 
-    net.send(b, e, b"not that way");
+    let (mut swapped, _) = two_ways_up(1, 5);
+    swapped.run();
+    swapped.find(e, f);
+    let out = swapped
+        .node_mut(e)
+        .send(f, b"either way".to_vec())
+        .expect("a route is known");
+    assert_eq!(out[0].to, b, "and the other way round when the prices are");
 
-    assert!(!net.node_mut(e).take_delivered().is_empty());
-    assert_eq!(net.hops, 3, "expected b -> c -> d -> e, not b -> d -> e");
-    assert!(
-        net.node_mut(c).take_delivered().is_empty(),
-        "c carried the packet, it was not addressed to it"
-    );
+    // Whichever way it goes, it gets there, and by the same number of hops.
+    net.send(e, f, b"either way");
+    assert!(!net.node_mut(f).take_delivered().is_empty());
+    assert_eq!(net.hops, 4, "expected e -> c -> a -> d -> f");
 }
 
 #[test]
 fn re_pricing_a_link_reshapes_the_tree() {
-    let (mut net, [a, b, c, d, e]) = ring_with_one_expensive_link();
+    let (mut net, [a, b, c, _d, e, _f]) = two_ways_up(5, 1);
     net.run();
-    assert_eq!(net.node(d).parent(), Some(c));
+    assert_eq!(net.node(e).parent(), Some(c));
 
-    // The link is measured again and turns out to be as good as any other,
-    // which is the same call that brought it up in the first place.
-    net.link(b, d, Cost::UNIT);
+    // e measures its link to c again and finds it worse than the one it had
+    // been preferring it to, which is the same call that brought it up in the
+    // first place. Nothing crosses the network to say so; e simply moves.
+    let now = net.now;
+    let outbound = net.node_mut(e).add_peer(now, c, cost(9));
+    assert!(
+        !outbound
+            .iter()
+            .any(|envelope| matches!(envelope.message, Message::Consent(_))),
+        "the link is the same link, so the bargain struck over it stands"
+    );
+    net.enqueue(e, outbound);
     net.run();
 
     assert_eq!(
-        net.node(d).parent(),
+        net.node(e).parent(),
         Some(b),
-        "the direct link is now cheapest"
+        "the other link is cheaper now"
     );
-    assert_eq!(net.node(d).cost_to_root(), 2);
-    assert_eq!(net.node(e).cost_to_root(), 3);
-    net.paths_agree_with_parents(&[a, b, c, d, e]);
+    assert_eq!(net.node(e).depth(), 2, "and just as near the root");
+    net.paths_agree_with_parents(&[a, b, c, e]);
 
-    // The tree moved, so the summaries moved with it: c - d has stopped being
-    // a tree link and b - d has become one.
-    assert_eq!(net.node(c).parent(), Some(b));
-    assert_eq!(net.node(d).summary_for(c), None);
-    assert!(net.node(d).summary_for(b).is_some());
-
-    net.send(a, e, b"straight through");
-    assert!(!net.node_mut(e).take_delivered().is_empty());
-    assert_eq!(net.hops, 3, "expected a -> b -> d -> e");
+    // The tree moved, so the summaries moved with it: c - e has stopped being
+    // a tree link and b - e has become one.
+    assert_eq!(net.node(e).summary_for(c), None);
+    assert!(net.node(e).summary_for(b).is_some());
 }
 
 #[test]
